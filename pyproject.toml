@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-emulate"
+version = "0.1.0"
+description = "MCP server for CPU emulation via Unicorn, Capstone, and Keystone"
+requires-python = ">=3.10"
+license = "GPL-2.0-only"
+dependencies = [
+    "mcp>=1.18.0",
+    "unicorn>=2.0.0",
+    "capstone>=5.0.0",
+    "keystone-engine>=0.9.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+mcp-emulate = "mcp_emulate.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_emulate"]
+
+
+[tool.pytest.ini_options]
+# Unicorn's JIT engine triggers Windows SEH (access violation) during normal
+# mem_map/reg_read/reg_write operations. With faulthandler enabled (pytest
+# default), these print alarming native stack traces despite being benign.
+faulthandler_timeout = 0
+addopts = "-p no:faulthandler"
