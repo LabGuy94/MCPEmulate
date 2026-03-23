@@ -181,6 +181,128 @@ def read_memory(
         return _error(str(exc))
 
 
+# -- Memory inspection tools -------------------------------------------------
+
+
+@mcp.tool()
+def list_regions(session_id: str) -> dict:
+    """List all mapped memory regions.
+
+    Args:
+        session_id: The session ID.
+    """
+    try:
+        session = sessions.get(session_id)
+        regions = session.list_regions()
+        return {
+            "regions": [{"address": r["address"], "size": r["size"], "perms": _perms_str(r["perms"])} for r in regions],
+            "count": len(regions),
+        }
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def hexdump(session_id: str, address: int, size: int = 256) -> dict:
+    """Formatted hex dump of memory.
+
+    Standard format: ADDR | 16 hex bytes (8+8) | ASCII.  Max 4096 bytes.
+
+    Args:
+        session_id: The session ID.
+        address: Start address.
+        size: Number of bytes to dump (default 256, max 4096).
+    """
+    try:
+        session = sessions.get(session_id)
+        dump = session.hexdump(address, size)
+        actual_size = min(size, 4096)
+        return {"hexdump": dump, "address": address, "size": actual_size}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def search_memory(
+    session_id: str, pattern: str, address: int | None = None,
+    size: int | None = None, max_results: int = 100,
+) -> dict:
+    """Search for a byte pattern in memory.
+
+    If address is None, searches all mapped regions.
+
+    Args:
+        session_id: The session ID.
+        pattern: Hex string of bytes to search for (e.g. "deadbeef").
+        address: Optional start address to limit search.
+        size: Optional size of search range (required if address is set).
+        max_results: Maximum matches to return (default 100).
+    """
+    try:
+        session = sessions.get(session_id)
+        raw_pattern = _decode_data(pattern, "hex")
+        matches = session.search_memory(raw_pattern, address=address, size=size, max_results=max_results)
+        return {"matches": matches, "count": len(matches), "truncated": len(matches) >= max_results}
+    except (KeyError, ValueError, Exception) as exc:
+        return _error(str(exc))
+
+
+# -- Watchpoint tools --------------------------------------------------------
+
+
+@mcp.tool()
+def add_watchpoint(
+    session_id: str, address: int, size: int = 1, access: str = "w",
+) -> dict:
+    """Add a memory watchpoint.
+
+    Idempotent -- same address replaces the existing watchpoint.
+
+    Args:
+        session_id: The session ID.
+        address: Memory address to watch.
+        size: Number of bytes to watch (default 1).
+        access: Access type -- "r" (read), "w" (write), or "rw" (both). Default "w".
+    """
+    try:
+        session = sessions.get(session_id)
+        total = session.add_watchpoint(address, size=size, access=access)
+        return {"address": address, "size": size, "access": access, "total_watchpoints": total}
+    except (KeyError, ValueError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def remove_watchpoint(session_id: str, address: int) -> dict:
+    """Remove a memory watchpoint.
+
+    Args:
+        session_id: The session ID.
+        address: The watchpoint address to remove.
+    """
+    try:
+        session = sessions.get(session_id)
+        total = session.remove_watchpoint(address)
+        return {"address": address, "total_watchpoints": total}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def list_watchpoints(session_id: str) -> dict:
+    """List all memory watchpoints.
+
+    Args:
+        session_id: The session ID.
+    """
+    try:
+        session = sessions.get(session_id)
+        wps = session.list_watchpoints()
+        return {"watchpoints": wps, "count": len(wps)}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
 # -- Register tools ----------------------------------------------------------
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
-from unicorn import Uc, UC_HOOK_CODE, UC_PROT_ALL, UC_PROT_READ, UC_PROT_WRITE, UC_PROT_EXEC
+from unicorn import Uc, UC_HOOK_CODE, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE, UC_MEM_WRITE, UC_MEM_READ, UC_PROT_ALL, UC_PROT_READ, UC_PROT_WRITE, UC_PROT_EXEC
 
 from .architectures import ArchConfig, get_arch
 
@@ -14,6 +14,13 @@ PAGE_SIZE = 0x1000
 
 # Permission string -> UC_PROT_* bitmask mapping.
 _PERM_BITS = {"r": UC_PROT_READ, "w": UC_PROT_WRITE, "x": UC_PROT_EXEC}
+
+# Watchpoint access type -> Unicorn hook type.
+_WP_ACCESS = {
+    "r": UC_HOOK_MEM_READ,
+    "w": UC_HOOK_MEM_WRITE,
+    "rw": UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE,
+}
 
 
 def parse_perms(perms: str) -> int:
@@ -51,7 +58,7 @@ class MemoryRegion:
 class EmulationSession:
     """Wraps a single Unicorn engine instance with bookkeeping."""
 
-    __slots__ = ("id", "arch", "uc", "mapped_regions", "_insn_count", "breakpoints", "_contexts", "_hit_breakpoint")
+    __slots__ = ("id", "arch", "uc", "mapped_regions", "_insn_count", "breakpoints", "_contexts", "_hit_breakpoint", "_watchpoints", "_hit_watchpoint")
 
     def __init__(self, session_id: str, arch: ArchConfig) -> None:
         self.id = session_id
@@ -62,6 +69,8 @@ class EmulationSession:
         self.breakpoints: set[int] = set()
         self._contexts: dict[str, object] = {}  # label -> UcContext
         self._hit_breakpoint: int | None = None
+        self._watchpoints: dict[int, tuple[int, int, str]] = {}  # addr -> (hook_handle, size, access_str)
+        self._hit_watchpoint: dict | None = None
 
     # -- Memory operations ---------------------------------------------------
 
@@ -83,6 +92,52 @@ class EmulationSession:
     def read_memory(self, address: int, size: int) -> bytes:
         """Read raw bytes from the emulator's memory."""
         return bytes(self.uc.mem_read(address, size))
+
+    def list_regions(self) -> list[dict]:
+        """Return all mapped memory regions."""
+        return [{"address": r.address, "size": r.size, "perms": r.perms} for r in self.mapped_regions]
+
+    def hexdump(self, address: int, size: int = 256) -> str:
+        """Formatted hex dump. Size capped at 4096 bytes."""
+        size = min(size, 4096)
+        data = self.read_memory(address, size)
+        lines = []
+        for offset in range(0, len(data), 16):
+            chunk = data[offset:offset + 16]
+            hex_left = " ".join(f"{b:02x}" for b in chunk[:8])
+            hex_right = " ".join(f"{b:02x}" for b in chunk[8:])
+            ascii_repr = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+            addr_str = f"{address + offset:08x}"
+            lines.append(f"{addr_str}  {hex_left:<23s}  {hex_right:<23s}  |{ascii_repr}|")
+        return "\n".join(lines)
+
+    def search_memory(self, pattern: bytes, address: int | None = None, size: int | None = None, max_results: int = 100) -> list[int]:
+        """Search for byte pattern in memory. Returns list of match addresses."""
+        matches: list[int] = []
+        if address is not None and size is not None:
+            # Search a specific range.
+            data = self.read_memory(address, size)
+            idx = 0
+            while idx <= len(data) - len(pattern) and len(matches) < max_results:
+                pos = data.find(pattern, idx)
+                if pos == -1:
+                    break
+                matches.append(address + pos)
+                idx = pos + 1
+        else:
+            # Search all mapped regions.
+            for region in self.mapped_regions:
+                if len(matches) >= max_results:
+                    break
+                data = self.read_memory(region.address, region.size)
+                idx = 0
+                while idx <= len(data) - len(pattern) and len(matches) < max_results:
+                    pos = data.find(pattern, idx)
+                    if pos == -1:
+                        break
+                    matches.append(region.address + pos)
+                    idx = pos + 1
+        return matches
 
     # -- Register operations -------------------------------------------------
 
@@ -134,6 +189,7 @@ class EmulationSession:
             raise ValueError("Must provide stop_address, count, or both")
 
         self._hit_breakpoint = None
+        self._hit_watchpoint = None
         self._insn_count = 0
 
         def _code_hook(uc: Uc, address: int, size: int, user_data: object) -> None:
@@ -165,6 +221,8 @@ class EmulationSession:
                 stop_reason = "breakpoint"
             elif count > 0 and self._insn_count >= count:
                 stop_reason = "count_exhausted"
+            elif self._hit_watchpoint is not None:
+                stop_reason = "watchpoint"
             # Unicorn signals timeout via exception in most cases, but guard:
             if timeout_us > 0 and stop_reason == "completed":
                 # If we reached here with fewer instructions than count and
@@ -183,6 +241,8 @@ class EmulationSession:
             result["error_detail"] = error_detail
         if self._hit_breakpoint is not None:
             result["breakpoint_address"] = self._hit_breakpoint
+        if self._hit_watchpoint is not None:
+            result["watchpoint"] = self._hit_watchpoint
         return result
 
     # -- Breakpoint operations -----------------------------------------------
@@ -203,6 +263,49 @@ class EmulationSession:
     def list_breakpoints(self) -> list[int]:
         """Return sorted list of breakpoint addresses."""
         return sorted(self.breakpoints)
+
+    # -- Watchpoint operations ---------------------------------------------------
+
+    def add_watchpoint(self, address: int, size: int = 1, access: str = "w") -> int:
+        """Add a memory watchpoint. Returns total watchpoint count.
+
+        Idempotent — same address replaces the existing watchpoint.
+        """
+        if access not in _WP_ACCESS:
+            raise ValueError(f"Invalid access type {access!r}. Use 'r', 'w', or 'rw'.")
+        # Remove existing watchpoint at this address if present.
+        if address in self._watchpoints:
+            self.uc.hook_del(self._watchpoints[address][0])
+
+        def _wp_callback(uc, acc, addr, sz, value, user_data):
+            self._hit_watchpoint = {
+                "address": addr,
+                "access": "write" if acc == UC_MEM_WRITE else "read",
+                "size": sz,
+                "value": value,
+            }
+            uc.emu_stop()
+
+        hook_type = _WP_ACCESS[access]
+        handle = self.uc.hook_add(hook_type, _wp_callback, begin=address, end=address + size - 1)
+        self._watchpoints[address] = (handle, size, access)
+        return len(self._watchpoints)
+
+    def remove_watchpoint(self, address: int) -> int:
+        """Remove a watchpoint. Returns total watchpoint count. Raises KeyError if not found."""
+        try:
+            handle, _, _ = self._watchpoints.pop(address)
+        except KeyError:
+            raise KeyError(f"No watchpoint at address 0x{address:x}") from None
+        self.uc.hook_del(handle)
+        return len(self._watchpoints)
+
+    def list_watchpoints(self) -> list[dict]:
+        """Return sorted list of watchpoints."""
+        return sorted(
+            [{"address": addr, "size": info[1], "access": info[2]} for addr, info in self._watchpoints.items()],
+            key=lambda w: w["address"],
+        )
 
     # -- Stepping ------------------------------------------------------------
 

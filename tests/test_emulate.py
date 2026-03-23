@@ -623,3 +623,174 @@ class TestServerBreakpointTools:
         assert r["registers"]["eax"] == 42
 
         destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Memory inspection (Iteration 3)
+# ---------------------------------------------------------------------------
+
+class TestMemoryInspection:
+    def test_list_regions(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.map_memory(0x2000, 0x2000)
+        regions = session.list_regions()
+        assert len(regions) == 2
+        assert regions[0]["address"] == 0x1000
+        assert regions[1]["address"] == 0x2000
+        assert regions[1]["size"] == 0x2000
+
+    def test_hexdump_basic(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.write_memory(0x1000, b"Hello World\x00")
+        dump = session.hexdump(0x1000, 16)
+        assert "48 65 6c 6c 6f 20 57 6f" in dump
+        assert "|Hello World." in dump
+
+    def test_hexdump_size_cap(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x2000)
+        # Request more than 4096 — should be capped.
+        dump = session.hexdump(0x1000, 8192)
+        # 4096 bytes / 16 per line = 256 lines
+        lines = dump.strip().split("\n")
+        assert len(lines) == 256
+
+    def test_search_memory_found(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.write_memory(0x1000, b"\x00" * 16 + b"\xDE\xAD" + b"\x00" * 32 + b"\xDE\xAD")
+        matches = session.search_memory(b"\xDE\xAD")
+        assert 0x1010 in matches
+        assert 0x1032 in matches
+        assert len(matches) == 2
+
+    def test_search_memory_not_found(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.write_memory(0x1000, b"\x00" * 64)
+        matches = session.search_memory(b"\xFF\xFF")
+        assert matches == []
+
+
+# ---------------------------------------------------------------------------
+# Watchpoints (Iteration 3)
+# ---------------------------------------------------------------------------
+
+class TestWatchpoints:
+    def test_add_remove_watchpoint(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        total = session.add_watchpoint(0x1000, size=4, access="w")
+        assert total == 1
+        wps = session.list_watchpoints()
+        assert len(wps) == 1
+        assert wps[0]["address"] == 0x1000
+        assert wps[0]["size"] == 4
+        assert wps[0]["access"] == "w"
+        total = session.remove_watchpoint(0x1000)
+        assert total == 0
+        assert session.list_watchpoints() == []
+
+    def test_watchpoint_on_write(self, manager: SessionManager) -> None:
+        """Assemble code that writes to memory, add write watchpoint, verify stop."""
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)  # code
+        session.map_memory(0x2000, 0x1000)  # data
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # mov dword ptr [0x2000], 0x42  — writes to 0x2000
+        encoding, _ = ks.asm("mov eax, 0x42; mov dword ptr [0x2000], eax")
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.add_watchpoint(0x2000, size=4, access="w")
+        result = session.emulate(address=0x1000, count=10)
+        assert result["stop_reason"] == "watchpoint"
+        assert result["watchpoint"]["access"] == "write"
+        assert result["watchpoint"]["address"] == 0x2000
+
+    def test_watchpoint_on_read(self, manager: SessionManager) -> None:
+        """Assemble code that reads from memory, add read watchpoint, verify stop."""
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)  # code
+        session.map_memory(0x2000, 0x1000)  # data
+        session.write_memory(0x2000, b"\x42\x00\x00\x00")
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # mov eax, dword ptr [0x2000]  — reads from 0x2000
+        encoding, _ = ks.asm("mov eax, dword ptr [0x2000]")
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.add_watchpoint(0x2000, size=4, access="r")
+        result = session.emulate(address=0x1000, count=10)
+        assert result["stop_reason"] == "watchpoint"
+        assert result["watchpoint"]["access"] == "read"
+
+    def test_watchpoint_idempotent(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.add_watchpoint(0x1000, size=4, access="w")
+        session.add_watchpoint(0x1000, size=4, access="w")  # replace
+        assert len(session.list_watchpoints()) == 1
+
+    def test_remove_nonexistent_raises(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        with pytest.raises(KeyError, match="No watchpoint"):
+            session.remove_watchpoint(0xDEAD)
+
+
+# ---------------------------------------------------------------------------
+# Server tools — Memory inspection & Watchpoints (Iteration 3)
+# ---------------------------------------------------------------------------
+
+class TestServerMemoryTools:
+    def test_list_regions_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory, list_regions,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+        map_memory(session_id=sid, address=0x2000, size=0x2000)
+
+        r = list_regions(session_id=sid)
+        assert "error" not in r
+        assert r["count"] == 2
+        assert r["regions"][0]["perms"] == "rwx"
+
+        destroy_emulator(session_id=sid)
+
+    def test_watchpoint_tool_roundtrip(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            add_watchpoint, remove_watchpoint, list_watchpoints,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+
+        r = add_watchpoint(session_id=sid, address=0x1000, size=4, access="w")
+        assert "error" not in r
+        assert r["total_watchpoints"] == 1
+
+        r = list_watchpoints(session_id=sid)
+        assert r["count"] == 1
+        assert r["watchpoints"][0]["address"] == 0x1000
+
+        r = remove_watchpoint(session_id=sid, address=0x1000)
+        assert "error" not in r
+        assert r["total_watchpoints"] == 0
+
+        r = list_watchpoints(session_id=sid)
+        assert r["count"] == 0
+
+        destroy_emulator(session_id=sid)
