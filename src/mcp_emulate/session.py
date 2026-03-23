@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+import time
+from collections import deque
 
 from unicorn import Uc, UC_HOOK_CODE, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE, UC_MEM_WRITE, UC_MEM_READ, UC_PROT_ALL, UC_PROT_READ, UC_PROT_WRITE, UC_PROT_EXEC
 
@@ -72,7 +74,7 @@ class EmulationSession:
         self._watchpoints: dict[int, tuple[int, int, str]] = {}  # addr -> (hook_handle, size, access_str)
         self._hit_watchpoint: dict | None = None
         self._trace_enabled: bool = False
-        self._trace_log: list[tuple[int, bytes]] = []  # (address, insn_bytes)
+        self._trace_log: deque[tuple[int, bytes]] = deque(maxlen=10_000)
         self._trace_max: int = 10_000
         self._symbols: dict[str, int] = {}  # name -> address
 
@@ -89,9 +91,26 @@ class EmulationSession:
         return region
 
     def write_memory(self, address: int, data: bytes) -> int:
-        """Write raw bytes into the emulator's memory. Returns bytes written."""
+        """Write raw bytes into the emulator's memory. Returns bytes written.
+
+        Raises ValueError if the target range is not within a writable region.
+        """
+        self._check_write_permission(address, len(data))
         self.uc.mem_write(address, data)
         return len(data)
+
+    def _check_write_permission(self, address: int, size: int) -> None:
+        """Verify every byte in [address, address+size) is covered by a writable region."""
+        end = address + size
+        for region in self.mapped_regions:
+            r_start = region.address
+            r_end = region.address + region.size
+            if r_start < end and r_end > address:
+                if not (region.perms & UC_PROT_WRITE):
+                    raise ValueError(
+                        f"Cannot write to address 0x{address:x}: region "
+                        f"0x{r_start:x}-0x{r_end:x} is not writable"
+                    )
 
     def read_memory(self, address: int, size: int) -> bytes:
         """Read raw bytes from the emulator's memory."""
@@ -102,18 +121,35 @@ class EmulationSession:
         return [{"address": r.address, "size": r.size, "perms": r.perms} for r in self.mapped_regions]
 
     def hexdump(self, address: int, size: int = 256) -> str:
-        """Formatted hex dump. Size capped at 4096 bytes."""
+        """Formatted hex dump. Size capped at 4096 bytes.
+
+        Consecutive identical lines are collapsed with '*' (like hexdump -C).
+        """
         size = min(size, 4096)
         data = self.read_memory(address, size)
-        lines = []
+        raw_lines: list[tuple[str, bytes]] = []
         for offset in range(0, len(data), 16):
             chunk = data[offset:offset + 16]
             hex_left = " ".join(f"{b:02x}" for b in chunk[:8])
             hex_right = " ".join(f"{b:02x}" for b in chunk[8:])
             ascii_repr = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
             addr_str = f"{address + offset:08x}"
-            lines.append(f"{addr_str}  {hex_left:<23s}  {hex_right:<23s}  |{ascii_repr}|")
-        return "\n".join(lines)
+            line = f"{addr_str}  {hex_left:<23s}  {hex_right:<23s}  |{ascii_repr}|"
+            raw_lines.append((line, chunk))
+
+        output: list[str] = []
+        prev_chunk: bytes | None = None
+        suppressing = False
+        for line, chunk in raw_lines:
+            if chunk == prev_chunk:
+                if not suppressing:
+                    output.append("*")
+                    suppressing = True
+            else:
+                output.append(line)
+                suppressing = False
+            prev_chunk = chunk
+        return "\n".join(output)
 
     def search_memory(self, pattern: bytes, address: int | None = None, size: int | None = None, max_results: int = 100) -> list[int]:
         """Search for byte pattern in memory. Returns list of match addresses."""
@@ -192,6 +228,7 @@ class EmulationSession:
         if stop_address == 0 and count == 0:
             raise ValueError("Must provide stop_address, count, or both")
 
+        t0 = time.perf_counter()
         self._hit_breakpoint = None
         self._hit_watchpoint = None
         self._insn_count = 0
@@ -202,7 +239,7 @@ class EmulationSession:
                 self._hit_breakpoint = address
                 uc.emu_stop()
                 return
-            if self._trace_enabled and len(self._trace_log) < self._trace_max:
+            if self._trace_enabled:
                 insn_bytes = bytes(uc.mem_read(address, size))
                 self._trace_log.append((address, insn_bytes))
 
@@ -231,18 +268,19 @@ class EmulationSession:
                 stop_reason = "count_exhausted"
             elif self._hit_watchpoint is not None:
                 stop_reason = "watchpoint"
-            # Unicorn signals timeout via exception in most cases, but guard:
             if timeout_us > 0 and stop_reason == "completed":
-                # If we reached here with fewer instructions than count and
-                # haven't hit stop_address, it might be timeout.  Unicorn 2
-                # raises UcError on timeout, so this branch is mostly a safety net.
-                pass
+                elapsed_us = (time.perf_counter() - t0) * 1_000_000
+                if elapsed_us >= timeout_us * 0.9:
+                    stop_reason = "timeout"
         finally:
             self.uc.hook_del(hook_handle)
+
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
         result: dict = {
             "stop_reason": stop_reason,
             "instructions_executed": self._insn_count,
+            "elapsed_ms": elapsed_ms,
             "registers": self.get_registers(),
         }
         if error_detail is not None:
@@ -286,11 +324,17 @@ class EmulationSession:
             self.uc.hook_del(self._watchpoints[address][0])
 
         def _wp_callback(uc, acc, addr, sz, value, user_data):
+            if acc == UC_MEM_WRITE:
+                actual_value = value
+            else:
+                # Unicorn passes value=0 for reads; fetch actual memory content.
+                raw = bytes(uc.mem_read(addr, sz))
+                actual_value = int.from_bytes(raw, byteorder="little")
             self._hit_watchpoint = {
                 "address": addr,
                 "access": "write" if acc == UC_MEM_WRITE else "read",
                 "size": sz,
-                "value": value,
+                "value": actual_value,
             }
             uc.emu_stop()
 
@@ -320,7 +364,7 @@ class EmulationSession:
     def enable_trace(self, max_entries: int = 10_000) -> None:
         """Enable instruction tracing, clearing any existing log."""
         self._trace_enabled = True
-        self._trace_log = []
+        self._trace_log = deque(maxlen=max_entries)
         self._trace_max = max_entries
 
     def disable_trace(self) -> int:
@@ -333,8 +377,10 @@ class EmulationSession:
         from capstone import Cs
 
         cs = Cs(self.arch.cs_arch, self.arch.cs_mode)
+        addr_to_symbol = {addr: name for name, addr in self._symbols.items()}
         total = len(self._trace_log)
-        selected = self._trace_log[offset:offset + limit]
+        log_list = list(self._trace_log)
+        selected = log_list[offset:offset + limit]
         entries = []
         for i, (addr, raw) in enumerate(selected, start=offset):
             insn = next(cs.disasm(raw, addr, count=1), None)
@@ -347,6 +393,9 @@ class EmulationSession:
             if insn is not None:
                 entry["mnemonic"] = insn.mnemonic
                 entry["op_str"] = insn.op_str
+            symbol = addr_to_symbol.get(addr)
+            if symbol is not None:
+                entry["symbol"] = symbol
             entries.append(entry)
         return {"entries": entries, "total": total, "offset": offset, "limit": limit}
 
@@ -387,6 +436,10 @@ class EmulationSession:
                 "bytes_hex": insn.bytes.hex(),
                 "size": insn.size,
             }
+        addr_to_symbol = {a: n for n, a in self._symbols.items()}
+        symbol = addr_to_symbol.get(address)
+        if symbol is not None:
+            step_result["symbol"] = symbol
         return step_result
 
     # -- Context save/restore ------------------------------------------------

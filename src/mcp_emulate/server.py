@@ -58,6 +58,16 @@ def _error(message: str, detail: str | None = None) -> dict[str, Any]:
     return result
 
 
+def _exc_message(exc: Exception) -> str:
+    """Extract a clean error message from an exception.
+
+    KeyError.__str__ wraps the message in repr quotes; unwrap it.
+    """
+    if isinstance(exc, KeyError) and exc.args:
+        return str(exc.args[0])
+    return str(exc)
+
+
 def _perms_str(bitmask: int) -> str:
     """Convert a UC_PROT bitmask back to a human-readable string."""
     from unicorn import UC_PROT_READ, UC_PROT_WRITE, UC_PROT_EXEC
@@ -88,7 +98,7 @@ def create_emulator(arch: str) -> dict:
         session = sessions.create(arch)
         return {"session_id": session.id, "arch": session.arch.name}
     except (ValueError, RuntimeError) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -102,7 +112,7 @@ def destroy_emulator(session_id: str) -> dict:
         sessions.destroy(session_id)
         return {"success": True}
     except KeyError as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 # -- Memory tools ------------------------------------------------------------
@@ -126,13 +136,16 @@ def map_memory(
         session = sessions.get(session_id)
         perm_bits = parse_perms(perms)
         region = session.map_memory(address, size, perm_bits)
-        return {
+        result = {
             "address": region.address,
             "size": region.size,
             "perms": _perms_str(region.perms),
         }
+        if region.size != size:
+            result["rounded_up_from"] = size
+        return result
     except (KeyError, ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -153,7 +166,7 @@ def write_memory(
         written = session.write_memory(address, raw)
         return {"address": address, "bytes_written": written}
     except (KeyError, ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -178,7 +191,7 @@ def read_memory(
             "encoding": encoding,
         }
     except (KeyError, ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 # -- Memory inspection tools -------------------------------------------------
@@ -199,7 +212,7 @@ def list_regions(session_id: str) -> dict:
             "count": len(regions),
         }
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -217,9 +230,13 @@ def hexdump(session_id: str, address: int, size: int = 256) -> dict:
         session = sessions.get(session_id)
         dump = session.hexdump(address, size)
         actual_size = min(size, 4096)
-        return {"hexdump": dump, "address": address, "size": actual_size}
+        result = {"hexdump": dump, "address": address, "size": actual_size}
+        if size > 4096:
+            result["clamped"] = True
+            result["requested_size"] = size
+        return result
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -244,7 +261,7 @@ def search_memory(
         matches = session.search_memory(raw_pattern, address=address, size=size, max_results=max_results)
         return {"matches": matches, "count": len(matches), "truncated": len(matches) >= max_results}
     except (KeyError, ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 # -- Watchpoint tools --------------------------------------------------------
@@ -269,7 +286,7 @@ def add_watchpoint(
         total = session.add_watchpoint(address, size=size, access=access)
         return {"address": address, "size": size, "access": access, "total_watchpoints": total}
     except (KeyError, ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -285,7 +302,7 @@ def remove_watchpoint(session_id: str, address: int) -> dict:
         total = session.remove_watchpoint(address)
         return {"address": address, "total_watchpoints": total}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -300,7 +317,7 @@ def list_watchpoints(session_id: str) -> dict:
         wps = session.list_watchpoints()
         return {"watchpoints": wps, "count": len(wps)}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 # -- Register tools ----------------------------------------------------------
@@ -319,7 +336,7 @@ def set_registers(session_id: str, values: dict[str, int]) -> dict:
         updated = session.set_registers(values)
         return {"updated": updated}
     except (KeyError, ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -335,7 +352,7 @@ def get_registers(session_id: str, names: list[str] | None = None) -> dict:
         regs = session.get_registers(names)
         return {"registers": regs}
     except (KeyError, ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 # -- Emulation ---------------------------------------------------------------
@@ -377,7 +394,7 @@ def emulate(
         )
         return result
     except (KeyError, ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -395,7 +412,7 @@ def add_breakpoint(session_id: str, address: int) -> dict:
         total = session.add_breakpoint(address)
         return {"address": address, "total_breakpoints": total}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -411,7 +428,7 @@ def remove_breakpoint(session_id: str, address: int) -> dict:
         total = session.remove_breakpoint(address)
         return {"address": address, "total_breakpoints": total}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -426,7 +443,7 @@ def list_breakpoints(session_id: str) -> dict:
         bps = session.list_breakpoints()
         return {"breakpoints": bps, "count": len(bps)}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -443,7 +460,7 @@ def step(session_id: str, address: int | None = None) -> dict:
         session = sessions.get(session_id)
         return session.step(address=address)
     except (KeyError, ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -461,7 +478,7 @@ def save_context(session_id: str, label: str) -> dict:
         labels = session.save_context(label)
         return {"label": label, "saved_labels": labels}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -477,7 +494,7 @@ def restore_context(session_id: str, label: str) -> dict:
         session.restore_context(label)
         return {"label": label, "registers": session.get_registers()}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 # -- Trace tools ---------------------------------------------------------------
@@ -498,7 +515,7 @@ def enable_trace(session_id: str, max_entries: int = 10000) -> dict:
         session.enable_trace(max_entries=max_entries)
         return {"enabled": True, "max_entries": max_entries}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -515,7 +532,7 @@ def disable_trace(session_id: str) -> dict:
         count = session.disable_trace()
         return {"enabled": False, "entries": count}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -533,7 +550,7 @@ def get_trace(session_id: str, offset: int = 0, limit: int = 100) -> dict:
         session = sessions.get(session_id)
         return session.get_trace(offset=offset, limit=limit)
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 # -- Symbol tools ---------------------------------------------------------------
@@ -555,7 +572,7 @@ def add_symbol(session_id: str, name: str, address: int) -> dict:
         total = session.add_symbol(name, address)
         return {"name": name, "address": address, "total_symbols": total}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -571,7 +588,7 @@ def remove_symbol(session_id: str, name: str) -> dict:
         total = session.remove_symbol(name)
         return {"name": name, "total_symbols": total}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -586,7 +603,7 @@ def list_symbols(session_id: str) -> dict:
         syms = session.list_symbols()
         return {"symbols": syms, "count": len(syms)}
     except (KeyError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 # -- Load tools -----------------------------------------------------------------
@@ -613,7 +630,7 @@ def load_binary(
         raw = _decode_data(data, encoding)
         return session.load_binary(raw, address, entry_point=entry_point)
     except (KeyError, ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 
@@ -644,7 +661,7 @@ def assemble(arch: str, code: str, address: int = 0) -> dict:
     except KsError as exc:
         return _error("Assembly failed", detail=str(exc))
     except (ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 @mcp.tool()
@@ -677,7 +694,7 @@ def disassemble(
             )
         return {"instructions": instructions}
     except (ValueError, Exception) as exc:
-        return _error(str(exc))
+        return _error(_exc_message(exc))
 
 
 # -- Entry point -------------------------------------------------------------

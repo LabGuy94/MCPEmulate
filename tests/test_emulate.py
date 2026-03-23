@@ -653,9 +653,10 @@ class TestMemoryInspection:
         session.map_memory(0x1000, 0x2000)
         # Request more than 4096 — should be capped.
         dump = session.hexdump(0x1000, 8192)
-        # 4096 bytes / 16 per line = 256 lines
+        # 4096 bytes of all-zeros collapses: first line + '*' = 2 lines.
         lines = dump.strip().split("\n")
-        assert len(lines) == 256
+        assert len(lines) == 2
+        assert lines[1] == "*"
 
     def test_search_memory_found(self, manager: SessionManager) -> None:
         session = manager.create("x86_32")
@@ -883,6 +884,7 @@ class TestTrace:
         assert trace["entries"][1]["index"] == 3
 
     def test_trace_max_cap(self, manager: SessionManager) -> None:
+        """Ring buffer keeps the LAST N entries when max_entries is exceeded."""
         from keystone import Ks
 
         arch = get_arch("x86_32")
@@ -896,7 +898,12 @@ class TestTrace:
         session.enable_trace(max_entries=3)
         session.emulate(address=0x1000, count=5)
         trace = session.get_trace(limit=10)
-        assert trace["total"] == 3  # capped
+        assert trace["total"] == 3  # capped at 3
+        # Ring buffer keeps LAST 3 entries (instructions 3, 4, 5).
+        # Instruction 3 is 'mov ecx, 3' at offset 10, 4 is 'mov edx, 4' at offset 15,
+        # 5 is 'inc eax' at offset 20.
+        assert trace["entries"][0]["address"] == 0x1000 + 10
+        assert trace["entries"][2]["mnemonic"] == "inc"
 
     def test_enable_clears_previous(self, manager: SessionManager) -> None:
         from keystone import Ks
@@ -1081,5 +1088,260 @@ class TestServerIteration5Tools:
         # Verify data was written.
         r = read_memory(session_id=sid, address=0x1000, size=5)
         assert r["data"] == code_hex
+
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Bug fixes and improvements (new tests)
+# ---------------------------------------------------------------------------
+
+class TestWritePermissions:
+    """Bug 1: write_memory must respect region permissions."""
+
+    def test_write_readonly_region_raises(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000, parse_perms("r"))
+        with pytest.raises(ValueError, match="not writable"):
+            session.write_memory(0x1000, b"\x90")
+
+    def test_write_readexec_region_raises(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000, parse_perms("rx"))
+        with pytest.raises(ValueError, match="not writable"):
+            session.write_memory(0x1000, b"\x90")
+
+    def test_write_writable_region_succeeds(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000, parse_perms("rw"))
+        written = session.write_memory(0x1000, b"\x90\xc3")
+        assert written == 2
+        assert session.read_memory(0x1000, 2) == b"\x90\xc3"
+
+    def test_write_rwx_region_succeeds(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)  # default is rwx
+        written = session.write_memory(0x1000, b"\xAA")
+        assert written == 1
+
+
+class TestTimeoutDetection:
+    """Bug 2: emulate should report timeout and elapsed_ms."""
+
+    def test_timeout_stop_reason(self, manager: SessionManager) -> None:
+        """Infinite loop with short timeout should report 'timeout'."""
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # Infinite loop: jmp to self
+        encoding, _ = ks.asm("label: jmp label", addr=0x1000)
+        session.write_memory(0x1000, bytes(encoding))
+
+        # Timeout of 50ms = 50000 us
+        result = session.emulate(
+            address=0x1000, stop_address=0xFFFF, timeout_us=50_000
+        )
+        assert result["stop_reason"] == "timeout"
+
+    def test_elapsed_ms_present(self, manager: SessionManager) -> None:
+        """Every emulate result should include elapsed_ms."""
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 42")
+        session.write_memory(0x1000, bytes(encoding))
+
+        result = session.emulate(address=0x1000, count=1)
+        assert "elapsed_ms" in result
+        assert isinstance(result["elapsed_ms"], float)
+        assert result["elapsed_ms"] >= 0
+
+
+class TestReadWatchpointValue:
+    """Bug 3: read watchpoint value must reflect actual memory content."""
+
+    def test_read_watchpoint_value(self, manager: SessionManager) -> None:
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)  # code
+        session.map_memory(0x2000, 0x1000)  # data
+
+        # Write a known value at 0x2000.
+        session.write_memory(0x2000, b"\x42\x00\x00\x00")
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # mov eax, dword ptr [0x2000]  — reads from 0x2000
+        encoding, _ = ks.asm("mov eax, dword ptr [0x2000]")
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.add_watchpoint(0x2000, size=4, access="r")
+        result = session.emulate(address=0x1000, count=10)
+        assert result["stop_reason"] == "watchpoint"
+        assert result["watchpoint"]["access"] == "read"
+        # The actual value at 0x2000 is 0x42 (little-endian).
+        assert result["watchpoint"]["value"] == 0x42
+
+
+class TestHexdumpCollapse:
+    """Improvement 1: hexdump collapses repeated lines with '*'."""
+
+    def test_hexdump_collapse_zeros(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        # 64 bytes of zeros: first line + '*' + no trailing distinct line
+        dump = session.hexdump(0x1000, 64)
+        lines = dump.strip().split("\n")
+        assert len(lines) == 2
+        assert lines[1] == "*"
+
+    def test_hexdump_no_collapse_distinct(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        # Write distinct data in each 16-byte line
+        for i in range(4):
+            session.write_memory(0x1000 + i * 16, bytes([i + 1] * 16))
+        dump = session.hexdump(0x1000, 64)
+        lines = dump.strip().split("\n")
+        # 4 distinct lines, no collapse
+        assert len(lines) == 4
+        assert "*" not in dump
+
+
+class TestTraceSymbols:
+    """Improvement 3: trace entries and step output include symbol names."""
+
+    def test_trace_includes_symbols(self, manager: SessionManager) -> None:
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2")
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.add_symbol("entry", 0x1000)
+        session.enable_trace()
+        session.emulate(address=0x1000, count=2)
+        trace = session.get_trace()
+        assert trace["entries"][0].get("symbol") == "entry"
+        # Second instruction has no symbol.
+        assert "symbol" not in trace["entries"][1]
+
+    def test_step_includes_symbol(self, manager: SessionManager) -> None:
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 42")
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.add_symbol("main", 0x1000)
+        result = session.step(address=0x1000)
+        assert result.get("symbol") == "main"
+
+
+class TestServerBugFixes:
+    """Server-level tests for bug fixes and improvements."""
+
+    def test_write_memory_readonly_returns_error(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory, write_memory,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000, perms="r")
+        r = write_memory(session_id=sid, address=0x1000, data="90")
+        assert "error" in r
+        assert "not writable" in r["error"]
+        destroy_emulator(session_id=sid)
+
+    def test_error_format_no_double_quotes(self) -> None:
+        """Fix 4: KeyError messages should not have extra quotes."""
+        from mcp_emulate.server import destroy_emulator
+
+        r = destroy_emulator(session_id="bogus-session-id")
+        assert "error" in r
+        # Should NOT start with a quote character (the repr wrapping).
+        assert not r["error"].startswith("'"), f"Error has extra quotes: {r['error']!r}"
+        assert not r["error"].startswith('"'), f"Error has extra quotes: {r['error']!r}"
+        assert "No session with id" in r["error"]
+
+    def test_hexdump_clamped_field(self) -> None:
+        """Improvement 2: hexdump returns clamped flag when size exceeds 4096."""
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory, hexdump,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x2000)
+
+        # Request within limit — no clamped field.
+        r = hexdump(session_id=sid, address=0x1000, size=256)
+        assert "clamped" not in r
+        assert r["size"] == 256
+
+        # Request beyond limit — clamped field present.
+        r = hexdump(session_id=sid, address=0x1000, size=8192)
+        assert r["clamped"] is True
+        assert r["requested_size"] == 8192
+        assert r["size"] == 4096
+
+        destroy_emulator(session_id=sid)
+
+    def test_map_memory_rounded_up_from(self) -> None:
+        """Improvement 5: map_memory returns rounded_up_from when size was rounded."""
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+
+        # Size already page-aligned — no rounded_up_from.
+        r = map_memory(session_id=sid, address=0x1000, size=0x1000)
+        assert "rounded_up_from" not in r
+        assert r["size"] == 0x1000
+
+        # Size NOT page-aligned — rounded_up_from present.
+        r = map_memory(session_id=sid, address=0x2000, size=100)
+        assert r["rounded_up_from"] == 100
+        assert r["size"] == 0x1000
+
+        destroy_emulator(session_id=sid)
+
+    def test_emulate_elapsed_ms_in_server(self) -> None:
+        """Improvement 6: emulate response includes elapsed_ms."""
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            write_memory, assemble, emulate,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+
+        asm = assemble(arch="x86_32", code="mov eax, 1", address=0x1000)
+        write_memory(session_id=sid, address=0x1000, data=asm["bytes_hex"])
+
+        r = emulate(session_id=sid, address=0x1000, count=1)
+        assert "elapsed_ms" in r
+        assert isinstance(r["elapsed_ms"], float)
 
         destroy_emulator(session_id=sid)
