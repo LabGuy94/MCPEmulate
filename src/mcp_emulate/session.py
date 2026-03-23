@@ -182,6 +182,8 @@ class EmulationSession:
     def _check_write_permission(self, address: int, size: int) -> None:
         """Verify every byte in [address, address+size) is covered by a writable region."""
         end = address + size
+        # Collect writable intervals that overlap [address, end).
+        intervals: list[tuple[int, int]] = []
         for region in self.mapped_regions:
             r_start = region.address
             r_end = region.address + region.size
@@ -191,6 +193,28 @@ class EmulationSession:
                         f"Cannot write to address 0x{address:x}: region "
                         f"0x{r_start:x}-0x{r_end:x} is not writable"
                     )
+                intervals.append((max(r_start, address), min(r_end, end)))
+        # Verify full coverage.
+        if not intervals:
+            raise ValueError(
+                f"Cannot write to address 0x{address:x}: no mapped region covers this range"
+            )
+        intervals.sort()
+        covered_end = intervals[0][0]
+        if covered_end > address:
+            raise ValueError(
+                f"Cannot write to address 0x{address:x}: unmapped gap at start of range"
+            )
+        for start, stop in intervals:
+            if start > covered_end:
+                raise ValueError(
+                    f"Cannot write to address 0x{address:x}: unmapped gap at 0x{covered_end:x}"
+                )
+            covered_end = max(covered_end, stop)
+        if covered_end < end:
+            raise ValueError(
+                f"Cannot write to address 0x{address:x}: unmapped gap at 0x{covered_end:x}"
+            )
 
     def read_memory(self, address: int, size: int) -> bytes:
         """Read raw bytes from the emulator's memory."""
@@ -824,12 +848,14 @@ class EmulationSession:
             if _saved_bp is not _NO_BP:
                 self.breakpoints[address] = _saved_bp
 
-        # Disassemble the single instruction that was at `address`.
-        # Read enough bytes for the longest possible instruction (15 for x86).
-        try:
-            code = self.read_memory(address, 16)
-        except Exception:
-            code = self.read_memory(address, 4)  # ARM instructions are 4 bytes
+        # Read up to 16 bytes for disassembly, clamped to region boundary.
+        max_read = 16
+        for region in self.mapped_regions:
+            r_end = region.address + region.size
+            if region.address <= address < r_end:
+                max_read = min(max_read, r_end - address)
+                break
+        code = self.read_memory(address, max(max_read, 1))
 
         cs = Cs(self.arch.cs_arch, self.arch.cs_mode)
         insn = next(cs.disasm(code, address, count=1), None)
@@ -1114,9 +1140,10 @@ class EmulationSession:
         if aligned_size == 0:
             aligned_size = PAGE_SIZE
         self.uc.mem_unmap(address, aligned_size)
+        unmap_end = address + aligned_size
         self.mapped_regions = [
             r for r in self.mapped_regions
-            if not (r.address == address and r.size == aligned_size)
+            if not (r.address >= address and r.address + r.size <= unmap_end)
         ]
         return {"address": address, "size": aligned_size}
 
@@ -1159,13 +1186,20 @@ class EmulationSession:
         self._coverage_enabled = False
         return {"enabled": False, "blocks_hit": len(self._coverage_data)}
 
-    def get_coverage(self) -> dict:
-        """Return collected code coverage data."""
+    def get_coverage(self, offset: int = 0, limit: int = 100) -> dict:
+        """Return collected code coverage data with pagination."""
         blocks = sorted(
             [{"address": addr, **data} for addr, data in self._coverage_data.items()],
             key=lambda b: b["address"],
         )
-        return {"blocks": blocks, "total_blocks_hit": len(blocks)}
+        total = len(blocks)
+        selected = blocks[offset:offset + limit]
+        return {
+            "blocks": selected,
+            "total_blocks_hit": total,
+            "offset": offset,
+            "limit": limit,
+        }
 
     # -- Convenience tools -----------------------------------------------------
 

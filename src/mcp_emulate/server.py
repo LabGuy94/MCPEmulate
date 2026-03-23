@@ -144,7 +144,7 @@ def map_memory(
         if region.size != size:
             result["rounded_up_from"] = size
         return result
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -165,7 +165,7 @@ def write_memory(
         raw = _decode_data(data, encoding)
         written = session.write_memory(address, raw)
         return {"address": address, "bytes_written": written}
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -190,7 +190,7 @@ def read_memory(
             "data": _encode_data(raw, encoding),
             "encoding": encoding,
         }
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -211,7 +211,7 @@ def list_regions(session_id: str) -> dict:
             "regions": [{"address": r["address"], "size": r["size"], "perms": _perms_str(r["perms"])} for r in regions],
             "count": len(regions),
         }
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -235,7 +235,7 @@ def hexdump(session_id: str, address: int, size: int = 256) -> dict:
             result["clamped"] = True
             result["requested_size"] = size
         return result
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -260,7 +260,7 @@ def search_memory(
         raw_pattern = _decode_data(pattern, "hex")
         matches = session.search_memory(raw_pattern, address=address, size=size, max_results=max_results)
         return {"matches": matches, "count": len(matches), "truncated": len(matches) >= max_results}
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -280,7 +280,7 @@ def snapshot_memory(session_id: str, label: str) -> dict:
     try:
         session = sessions.get(session_id)
         return session.snapshot_memory(label)
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -296,7 +296,7 @@ def diff_memory(session_id: str, label_a: str, label_b: str) -> dict:
     try:
         session = sessions.get(session_id)
         return session.diff_memory(label_a, label_b)
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -317,7 +317,7 @@ def get_stack(session_id: str, count: int = 16) -> dict:
         session = sessions.get(session_id)
         count = min(count, 256)
         return session.get_stack(count=count)
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -337,7 +337,7 @@ def memory_map(session_id: str) -> dict:
         session = sessions.get(session_id)
         text = session.memory_map()
         return {"map": text, "region_count": len(session.mapped_regions)}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -362,7 +362,7 @@ def add_watchpoint(
         session = sessions.get(session_id)
         total = session.add_watchpoint(address, size=size, access=access)
         return {"address": address, "size": size, "access": access, "total_watchpoints": total}
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -378,7 +378,7 @@ def remove_watchpoint(session_id: str, address: int) -> dict:
         session = sessions.get(session_id)
         total = session.remove_watchpoint(address)
         return {"address": address, "total_watchpoints": total}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -393,7 +393,7 @@ def list_watchpoints(session_id: str) -> dict:
         session = sessions.get(session_id)
         wps = session.list_watchpoints()
         return {"watchpoints": wps, "count": len(wps)}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -412,7 +412,7 @@ def set_registers(session_id: str, values: dict[str, int]) -> dict:
         session = sessions.get(session_id)
         updated = session.set_registers(values)
         return {"updated": updated}
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -428,7 +428,7 @@ def get_registers(session_id: str, names: list[str] | None = None) -> dict:
         session = sessions.get(session_id)
         regs = session.get_registers(names)
         return {"registers": regs}
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -470,7 +470,7 @@ def emulate(
             timeout_us=timeout_us,
         )
         return result
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -489,7 +489,7 @@ def add_breakpoint(session_id: str, address: int, condition: str | None = None) 
         session = sessions.get(session_id)
         total = session.add_breakpoint(address, condition=condition)
         return {"address": address, "condition": condition, "total_breakpoints": total}
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -505,7 +505,7 @@ def remove_breakpoint(session_id: str, address: int) -> dict:
         session = sessions.get(session_id)
         total = session.remove_breakpoint(address)
         return {"address": address, "total_breakpoints": total}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -520,7 +520,7 @@ def list_breakpoints(session_id: str) -> dict:
         session = sessions.get(session_id)
         bps = session.list_breakpoints()
         return {"breakpoints": bps, "count": len(bps)}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -537,7 +537,7 @@ def step(session_id: str, address: int | None = None) -> dict:
     try:
         session = sessions.get(session_id)
         return session.step(address=address)
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -555,7 +555,7 @@ def save_context(session_id: str, label: str) -> dict:
         session = sessions.get(session_id)
         labels = session.save_context(label)
         return {"label": label, "saved_labels": labels}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -571,7 +571,7 @@ def restore_context(session_id: str, label: str) -> dict:
         session = sessions.get(session_id)
         session.restore_context(label)
         return {"label": label, "registers": session.get_registers()}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -592,7 +592,7 @@ def enable_trace(session_id: str, max_entries: int = 10000) -> dict:
         session = sessions.get(session_id)
         session.enable_trace(max_entries=max_entries)
         return {"enabled": True, "max_entries": max_entries}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -609,7 +609,7 @@ def disable_trace(session_id: str) -> dict:
         session = sessions.get(session_id)
         count = session.disable_trace()
         return {"enabled": False, "entries": count}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -627,7 +627,7 @@ def get_trace(session_id: str, offset: int = 0, limit: int = 100) -> dict:
     try:
         session = sessions.get(session_id)
         return session.get_trace(offset=offset, limit=limit)
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -647,7 +647,7 @@ def save_trace(session_id: str, label: str) -> dict:
     try:
         session = sessions.get(session_id)
         return session.save_trace(label)
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -665,7 +665,7 @@ def diff_trace(session_id: str, label_a: str, label_b: str) -> dict:
     try:
         session = sessions.get(session_id)
         return session.diff_trace(label_a, label_b)
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -690,7 +690,7 @@ def hook_syscall(session_id: str, mode: str = "skip", default_return: int = 0) -
     try:
         session = sessions.get(session_id)
         return session.hook_syscall(mode=mode, default_return=default_return)
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -704,7 +704,7 @@ def unhook_syscall(session_id: str) -> dict:
     try:
         session = sessions.get(session_id)
         return session.unhook_syscall()
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -720,7 +720,7 @@ def get_syscall_log(session_id: str, offset: int = 0, limit: int = 100) -> dict:
     try:
         session = sessions.get(session_id)
         return session.get_syscall_log(offset=offset, limit=limit)
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -742,7 +742,7 @@ def add_symbol(session_id: str, name: str, address: int) -> dict:
         session = sessions.get(session_id)
         total = session.add_symbol(name, address)
         return {"name": name, "address": address, "total_symbols": total}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -758,7 +758,7 @@ def remove_symbol(session_id: str, name: str) -> dict:
         session = sessions.get(session_id)
         total = session.remove_symbol(name)
         return {"name": name, "total_symbols": total}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -773,7 +773,7 @@ def list_symbols(session_id: str) -> dict:
         session = sessions.get(session_id)
         syms = session.list_symbols()
         return {"symbols": syms, "count": len(syms)}
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -800,7 +800,7 @@ def load_binary(
         session = sessions.get(session_id)
         raw = _decode_data(data, encoding)
         return session.load_binary(raw, address, entry_point=entry_point)
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -823,7 +823,7 @@ def load_executable(
         session = sessions.get(session_id)
         raw = _decode_data(data, encoding)
         return session.load_executable(raw, base_address=base_address)
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -840,7 +840,7 @@ def export_session(session_id: str) -> dict:
     try:
         session = sessions.get(session_id)
         return session.export_state()
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -865,7 +865,7 @@ def import_session(arch: str, state: dict) -> dict:
             "watchpoints_restored": len(state.get("watchpoints", [])),
             "symbols_restored": len(state.get("symbols", [])),
         }
-    except (KeyError, ValueError, RuntimeError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -897,7 +897,7 @@ def assemble(arch: str, code: str, address: int = 0) -> dict:
         }
     except KsError as exc:
         return _error("Assembly failed", detail=str(exc))
-    except (ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -930,7 +930,7 @@ def disassemble(
                 }
             )
         return {"instructions": instructions}
-    except (ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -952,7 +952,7 @@ def unmap_memory(session_id: str, address: int, size: int) -> dict:
     try:
         session = sessions.get(session_id)
         return session.unmap_memory(address, size)
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -970,7 +970,7 @@ def protect_memory(session_id: str, address: int, size: int, perms: str = "rwx")
         session = sessions.get(session_id)
         perm_bits = parse_perms(perms)
         return session.protect_memory(address, size, perm_bits)
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -989,7 +989,7 @@ def enable_coverage(session_id: str) -> dict:
     try:
         session = sessions.get(session_id)
         return session.enable_coverage()
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -1005,23 +1005,25 @@ def disable_coverage(session_id: str) -> dict:
     try:
         session = sessions.get(session_id)
         return session.disable_coverage()
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
 @mcp.tool()
-def get_coverage(session_id: str) -> dict:
+def get_coverage(session_id: str, offset: int = 0, limit: int = 100) -> dict:
     """Get collected code coverage data.
 
     Returns list of basic blocks hit with execution counts.
 
     Args:
         session_id: The session ID.
+        offset: Start index (default 0).
+        limit: Max entries to return (default 100).
     """
     try:
         session = sessions.get(session_id)
-        return session.get_coverage()
-    except (KeyError, Exception) as exc:
+        return session.get_coverage(offset=offset, limit=limit)
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -1042,7 +1044,7 @@ def setup_stack(session_id: str, address: int = 0x7FFF0000, size: int = 0x10000)
     try:
         session = sessions.get(session_id)
         return session.setup_stack(address, size)
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -1060,7 +1062,7 @@ def assemble_and_load(session_id: str, code: str, address: int) -> dict:
     try:
         session = sessions.get(session_id)
         return session.assemble_and_load(code, address)
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -1078,7 +1080,7 @@ def diff_context(session_id: str, label_a: str, label_b: str) -> dict:
     try:
         session = sessions.get(session_id)
         return session.diff_context(label_a, label_b)
-    except (KeyError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -1097,7 +1099,7 @@ def fill_memory(session_id: str, address: int, size: int, pattern: str = "00") -
         raw = _decode_data(pattern, "hex")
         bytes_written = session.fill_memory(address, size, raw)
         return {"address": address, "size": bytes_written, "pattern_hex": pattern}
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -1115,7 +1117,7 @@ def nop_out(session_id: str, address: int, size: int) -> dict:
     try:
         session = sessions.get(session_id)
         return session.nop_out(address, size)
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -1148,8 +1150,8 @@ def detect_arch(data: str, encoding: str = "hex") -> dict:
             endian_val = binary.header.identity_data
             endian = "big" if endian_val == lief.ELF.Header.ELF_DATA.MSB else "little"
             _elf_map = {
-                lief.ELF.ARCH.i386: "x86_32",
-                lief.ELF.ARCH.x86_64: "x86_64",
+                lief.ELF.ARCH.I386: "x86_32",
+                lief.ELF.ARCH.X86_64: "x86_64",
                 lief.ELF.ARCH.ARM: "arm",
                 lief.ELF.ARCH.AARCH64: "arm64",
                 lief.ELF.ARCH.MIPS: "mips32be" if endian == "big" else "mips32",
@@ -1183,7 +1185,7 @@ def detect_arch(data: str, encoding: str = "hex") -> dict:
             return _error(f"Could not determine architecture from {fmt} binary")
 
         return {"arch": detected_arch, "format": fmt, "endian": endian}
-    except (ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 
@@ -1211,7 +1213,7 @@ def run_and_diff(
             address=address, stop_address=stop_address,
             count=count, timeout_us=timeout_us,
         )
-    except (KeyError, ValueError, Exception) as exc:
+    except Exception as exc:
         return _error(_exc_message(exc))
 
 

@@ -496,6 +496,20 @@ class TestStep:
         assert result["registers"]["eax"] == 0
 
 
+    def test_step_near_region_end(self, manager: SessionManager) -> None:
+        """Step at end of a small region should not fail on disassembly read."""
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        # Map only 6 bytes total.
+        session.map_memory(0x1000, 0x1000)  # minimum page size
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # 'nop' is 1 byte (0x90). Write one nop at offset 0xFFE (2 bytes from end).
+        encoding, _ = ks.asm("nop")
+        session.write_memory(0x1000 + 0xFFE, bytes(encoding))
+        result = session.step(address=0x1000 + 0xFFE)
+        assert result["instruction"]["mnemonic"] == "nop"
+
 # ---------------------------------------------------------------------------
 # Context save/restore
 # ---------------------------------------------------------------------------
@@ -1124,6 +1138,28 @@ class TestWritePermissions:
         written = session.write_memory(0x1000, b"\xAA")
         assert written == 1
 
+
+    def test_write_spanning_two_adjacent_regions_succeeds(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000, parse_perms("rw"))
+        session.map_memory(0x2000, 0x1000, parse_perms("rw"))
+        # Write spanning boundary between two adjacent writable regions.
+        written = session.write_memory(0x1FF0, b"\xAA" * 32)
+        assert written == 32
+        assert session.read_memory(0x1FF0, 32) == b"\xAA" * 32
+
+    def test_write_into_unmapped_space_raises(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000, parse_perms("rw"))
+        # Write starts in mapped region but extends past it into unmapped space.
+        with pytest.raises(ValueError, match="unmapped gap"):
+            session.write_memory(0x1FF0, b"\xAA" * 32)
+
+    def test_write_completely_unmapped_raises(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000, parse_perms("rw"))
+        with pytest.raises(ValueError, match="no mapped region"):
+            session.write_memory(0x5000, b"\x90")
 
 class TestTimeoutDetection:
     """Bug 2: emulate should report timeout and elapsed_ms."""
@@ -2116,6 +2152,16 @@ class TestUnmapMemory:
         assert r["size"] == 0x1000
         destroy_emulator(session_id=sid)
 
+    def test_unmap_removes_tracking(self, manager: SessionManager) -> None:
+        """After unmap, mapped_regions must not contain the unmapped region."""
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        assert len(session.mapped_regions) == 1
+        session.unmap_memory(0x1000, 0x1000)
+        assert len(session.mapped_regions) == 0
+        # Double-check: list_regions should be empty.
+        assert session.list_regions() == []
+
 
 # ---------------------------------------------------------------------------
 # Protect memory
@@ -2199,6 +2245,27 @@ class TestCoverage:
         assert r["enabled"] is False
         destroy_emulator(session_id=sid)
 
+
+    def test_coverage_pagination(self, manager: SessionManager) -> None:
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2; mov ecx, 3")
+        session.write_memory(0x1000, bytes(encoding))
+        session.enable_coverage()
+        session.emulate(address=0x1000, count=3)
+        # Get all coverage.
+        full = session.get_coverage(offset=0, limit=1000)
+        total = full["total_blocks_hit"]
+        assert total >= 1
+        # Paginate with limit=1.
+        page = session.get_coverage(offset=0, limit=1)
+        assert len(page["blocks"]) <= 1
+        assert page["total_blocks_hit"] == total
+        assert page["offset"] == 0
+        assert page["limit"] == 1
 
 # ---------------------------------------------------------------------------
 # Convenience tools (session level)
@@ -2405,3 +2472,31 @@ class TestArchConfigFields:
         for name, arch in ARCHITECTURES.items():
             assert len(arch.nop_bytes) > 0, f"{name} has empty nop_bytes"
             assert len(arch.nop_bytes) in (1, 4), f"{name} has unexpected NOP size {len(arch.nop_bytes)}"
+
+
+# ---------------------------------------------------------------------------
+# Detect arch
+# ---------------------------------------------------------------------------
+
+
+class TestDetectArch:
+    def test_detect_elf_x86_32(self) -> None:
+        from mcp_emulate.server import detect_arch
+        import struct
+        # Minimal ELF32 header (52 bytes).
+        elf = bytearray(52)
+        elf[0:4] = b"\x7fELF"      # e_ident magic
+        elf[4] = 1                   # EI_CLASS: ELFCLASS32
+        elf[5] = 1                   # EI_DATA: ELFDATA2LSB
+        elf[6] = 1                   # EI_VERSION
+        struct.pack_into("<H", elf, 18, 3)  # e_machine: EM_386 = 3
+        r = detect_arch(data=elf.hex())
+        assert "error" not in r
+        assert r["arch"] == "x86_32"
+        assert r["format"] == "elf"
+        assert r["endian"] == "little"
+
+    def test_detect_invalid_binary(self) -> None:
+        from mcp_emulate.server import detect_arch
+        r = detect_arch(data="00")
+        assert "error" in r
