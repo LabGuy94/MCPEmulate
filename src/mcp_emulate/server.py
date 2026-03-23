@@ -258,6 +258,106 @@ def emulate(
         return _error(str(exc))
 
 
+@mcp.tool()
+def add_breakpoint(session_id: str, address: int) -> dict:
+    """Add a breakpoint at the given address.
+
+    Idempotent \u2014 adding the same address twice is a no-op.
+
+    Args:
+        session_id: The session ID.
+        address: The address to break at.
+    """
+    try:
+        session = sessions.get(session_id)
+        total = session.add_breakpoint(address)
+        return {"address": address, "total_breakpoints": total}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def remove_breakpoint(session_id: str, address: int) -> dict:
+    """Remove a breakpoint.
+
+    Args:
+        session_id: The session ID.
+        address: The breakpoint address to remove.
+    """
+    try:
+        session = sessions.get(session_id)
+        total = session.remove_breakpoint(address)
+        return {"address": address, "total_breakpoints": total}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def list_breakpoints(session_id: str) -> dict:
+    """List all breakpoints in the session.
+
+    Args:
+        session_id: The session ID.
+    """
+    try:
+        session = sessions.get(session_id)
+        bps = session.list_breakpoints()
+        return {"breakpoints": bps, "count": len(bps)}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def step(session_id: str, address: int | None = None) -> dict:
+    """Execute a single instruction.
+
+    If address is omitted, execution starts at the current program counter.
+
+    Args:
+        session_id: The session ID.
+        address: Optional start address. Defaults to current PC.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.step(address=address)
+    except (KeyError, ValueError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def save_context(session_id: str, label: str) -> dict:
+    """Save a register snapshot under a label.
+
+    Overwrites if the label already exists.
+
+    Args:
+        session_id: The session ID.
+        label: A name for this snapshot.
+    """
+    try:
+        session = sessions.get(session_id)
+        labels = session.save_context(label)
+        return {"label": label, "saved_labels": labels}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def restore_context(session_id: str, label: str) -> dict:
+    """Restore registers from a previously saved snapshot.
+
+    Args:
+        session_id: The session ID.
+        label: The snapshot label to restore.
+    """
+    try:
+        session = sessions.get(session_id)
+        session.restore_context(label)
+        return {"label": label, "registers": session.get_registers()}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
 # -- Standalone tools (no session needed) ------------------------------------
 
 

@@ -338,3 +338,288 @@ class TestServerTools:
         # Cleanup.
         r = destroy_emulator(session_id=sid)
         assert r.get("success") is True
+
+
+
+# ---------------------------------------------------------------------------
+# Breakpoints
+# ---------------------------------------------------------------------------
+
+class TestBreakpoints:
+    def test_add_remove_breakpoint(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        assert session.add_breakpoint(0x1000) == 1
+        assert session.add_breakpoint(0x2000) == 2
+        assert session.list_breakpoints() == [0x1000, 0x2000]
+        assert session.remove_breakpoint(0x1000) == 1
+        assert session.list_breakpoints() == [0x2000]
+
+    def test_add_duplicate_is_idempotent(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        assert session.add_breakpoint(0x1000) == 1
+        assert session.add_breakpoint(0x1000) == 1  # no change
+        assert session.list_breakpoints() == [0x1000]
+
+    def test_remove_nonexistent_raises(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        with pytest.raises(KeyError, match="No breakpoint"):
+            session.remove_breakpoint(0xDEAD)
+
+    def test_emulate_hits_breakpoint(self, manager: SessionManager) -> None:
+        """Assemble 4 MOV instructions, breakpoint on 3rd, verify stop."""
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # 4 instructions: each 'mov reg, imm32' is 5 bytes on x86_32
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2; mov ecx, 3; mov edx, 4")
+        code = bytes(encoding)
+        session.write_memory(0x1000, code)
+
+        # Breakpoint on 3rd instruction (offset 10 = 2 * 5 bytes)
+        bp_addr = 0x1000 + 10
+        session.add_breakpoint(bp_addr)
+
+        result = session.emulate(address=0x1000, count=100)
+        assert result["stop_reason"] == "breakpoint"
+        assert result["breakpoint_address"] == bp_addr
+        # Only first 2 instructions executed
+        assert result["instructions_executed"] == 2
+        assert result["registers"]["eax"] == 1
+        assert result["registers"]["ebx"] == 2
+        # 3rd and 4th did NOT execute
+        assert result["registers"]["ecx"] == 0
+        assert result["registers"]["edx"] == 0
+        # PC should be at the breakpoint address
+        assert result["registers"]["eip"] == bp_addr
+
+    def test_resume_after_breakpoint(self, manager: SessionManager) -> None:
+        """Hit a breakpoint, then resume and verify remaining instructions execute."""
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2; mov ecx, 3; mov edx, 4")
+        code = bytes(encoding)
+        session.write_memory(0x1000, code)
+
+        # Breakpoint on 3rd instruction
+        bp_addr = 0x1000 + 10
+        session.add_breakpoint(bp_addr)
+
+        # First run: hits breakpoint
+        result = session.emulate(address=0x1000, count=100)
+        assert result["stop_reason"] == "breakpoint"
+
+        # Remove breakpoint and resume from PC
+        session.remove_breakpoint(bp_addr)
+        pc = result["registers"]["eip"]
+        result2 = session.emulate(address=pc, count=2)
+        assert result2["stop_reason"] == "count_exhausted"
+        assert result2["registers"]["ecx"] == 3
+        assert result2["registers"]["edx"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Stepping
+# ---------------------------------------------------------------------------
+
+class TestStep:
+    def test_step_single_instruction(self, manager: SessionManager) -> None:
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 42; mov ebx, 99")
+        session.write_memory(0x1000, bytes(encoding))
+
+        result = session.step(address=0x1000)
+        assert result["address"] == 0x1000
+        assert result["instruction"]["mnemonic"] == "mov"
+        assert result["registers"]["eax"] == 42
+        # ebx should not have been touched yet
+        assert result["registers"]["ebx"] == 0
+
+    def test_step_sequence(self, manager: SessionManager) -> None:
+        """Step 3 times and verify progressive register changes."""
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2; mov ecx, 3")
+        session.write_memory(0x1000, bytes(encoding))
+
+        r1 = session.step(address=0x1000)
+        assert r1["registers"]["eax"] == 1
+        assert r1["registers"]["ebx"] == 0
+
+        # Step from where PC now points
+        pc = r1["registers"]["eip"]
+        r2 = session.step(address=pc)
+        assert r2["registers"]["ebx"] == 2
+        assert r2["registers"]["ecx"] == 0
+
+        pc = r2["registers"]["eip"]
+        r3 = session.step(address=pc)
+        assert r3["registers"]["ecx"] == 3
+
+    def test_step_from_explicit_address(self, manager: SessionManager) -> None:
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 10; mov ebx, 20")
+        code = bytes(encoding)
+        session.write_memory(0x1000, code)
+
+        # Skip first instruction, step only the second
+        second_addr = 0x1000 + 5  # mov eax, imm32 is 5 bytes
+        result = session.step(address=second_addr)
+        assert result["address"] == second_addr
+        assert result["registers"]["ebx"] == 20
+        # eax was never executed
+        assert result["registers"]["eax"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Context save/restore
+# ---------------------------------------------------------------------------
+
+class TestContext:
+    def test_save_restore_roundtrip(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.set_registers({"eax": 100, "ebx": 200})
+        labels = session.save_context("snap1")
+        assert "snap1" in labels
+
+        # Change registers
+        session.set_registers({"eax": 999, "ebx": 888})
+        assert session.get_register("eax") == 999
+
+        # Restore
+        session.restore_context("snap1")
+        assert session.get_register("eax") == 100
+        assert session.get_register("ebx") == 200
+
+    def test_restore_nonexistent_raises(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        with pytest.raises(KeyError, match="No saved context"):
+            session.restore_context("nope")
+
+    def test_overwrite_label(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.set_register("eax", 10)
+        session.save_context("snap")
+
+        session.set_register("eax", 20)
+        session.save_context("snap")  # overwrite
+
+        session.set_register("eax", 99)
+        session.restore_context("snap")
+        assert session.get_register("eax") == 20  # gets the latest save
+
+    def test_multiple_labels(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.set_register("eax", 1)
+        session.save_context("a")
+
+        session.set_register("eax", 2)
+        session.save_context("b")
+
+        session.set_register("eax", 99)
+
+        session.restore_context("a")
+        assert session.get_register("eax") == 1
+
+        session.restore_context("b")
+        assert session.get_register("eax") == 2
+
+
+# ---------------------------------------------------------------------------
+# Server tool wrappers for new tools
+# ---------------------------------------------------------------------------
+
+class TestServerBreakpointTools:
+    def test_breakpoint_tool_roundtrip(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            add_breakpoint, remove_breakpoint, list_breakpoints,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+
+        r = add_breakpoint(session_id=sid, address=0x1000)
+        assert "error" not in r
+        assert r["total_breakpoints"] == 1
+
+        r = list_breakpoints(session_id=sid)
+        assert r["breakpoints"] == [0x1000]
+        assert r["count"] == 1
+
+        r = remove_breakpoint(session_id=sid, address=0x1000)
+        assert "error" not in r
+        assert r["total_breakpoints"] == 0
+
+        r = list_breakpoints(session_id=sid)
+        assert r["count"] == 0
+
+        destroy_emulator(session_id=sid)
+
+    def test_step_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            write_memory, assemble, step,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+
+        asm = assemble(arch="x86_32", code="mov eax, 77", address=0x1000)
+        write_memory(session_id=sid, address=0x1000, data=asm["bytes_hex"])
+
+        r = step(session_id=sid, address=0x1000)
+        assert "error" not in r
+        assert r["instruction"]["mnemonic"] == "mov"
+        assert r["registers"]["eax"] == 77
+
+        destroy_emulator(session_id=sid)
+
+    def test_context_tool_roundtrip(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator,
+            set_registers, get_registers,
+            save_context, restore_context,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+
+        set_registers(session_id=sid, values={"eax": 42})
+        r = save_context(session_id=sid, label="test")
+        assert "error" not in r
+        assert "test" in r["saved_labels"]
+
+        set_registers(session_id=sid, values={"eax": 0})
+        r = restore_context(session_id=sid, label="test")
+        assert "error" not in r
+        assert r["registers"]["eax"] == 42
+
+        destroy_emulator(session_id=sid)

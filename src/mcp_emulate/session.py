@@ -51,7 +51,7 @@ class MemoryRegion:
 class EmulationSession:
     """Wraps a single Unicorn engine instance with bookkeeping."""
 
-    __slots__ = ("id", "arch", "uc", "mapped_regions", "_insn_count")
+    __slots__ = ("id", "arch", "uc", "mapped_regions", "_insn_count", "breakpoints", "_contexts", "_hit_breakpoint")
 
     def __init__(self, session_id: str, arch: ArchConfig) -> None:
         self.id = session_id
@@ -59,6 +59,9 @@ class EmulationSession:
         self.uc = Uc(arch.uc_arch, arch.uc_mode)
         self.mapped_regions: list[MemoryRegion] = []
         self._insn_count: int = 0
+        self.breakpoints: set[int] = set()
+        self._contexts: dict[str, object] = {}  # label -> UcContext
+        self._hit_breakpoint: int | None = None
 
     # -- Memory operations ---------------------------------------------------
 
@@ -130,10 +133,14 @@ class EmulationSession:
         if stop_address == 0 and count == 0:
             raise ValueError("Must provide stop_address, count, or both")
 
+        self._hit_breakpoint = None
         self._insn_count = 0
 
         def _code_hook(uc: Uc, address: int, size: int, user_data: object) -> None:
             self._insn_count += 1
+            if address in self.breakpoints:
+                self._hit_breakpoint = address
+                uc.emu_stop()
 
         hook_handle = self.uc.hook_add(UC_HOOK_CODE, _code_hook)
         stop_reason = "completed"
@@ -151,7 +158,12 @@ class EmulationSession:
         else:
             error_detail = None
             # Determine stop reason when no exception.
-            if count > 0 and self._insn_count >= count:
+            if self._hit_breakpoint is not None:
+                # The hook incremented _insn_count for the breakpoint instruction
+                # that never actually executed. Correct the count.
+                self._insn_count -= 1
+                stop_reason = "breakpoint"
+            elif count > 0 and self._insn_count >= count:
                 stop_reason = "count_exhausted"
             # Unicorn signals timeout via exception in most cases, but guard:
             if timeout_us > 0 and stop_reason == "completed":
@@ -169,7 +181,82 @@ class EmulationSession:
         }
         if error_detail is not None:
             result["error_detail"] = error_detail
+        if self._hit_breakpoint is not None:
+            result["breakpoint_address"] = self._hit_breakpoint
         return result
+
+    # -- Breakpoint operations -----------------------------------------------
+
+    def add_breakpoint(self, address: int) -> int:
+        """Add a breakpoint. Returns total breakpoint count. Idempotent."""
+        self.breakpoints.add(address)
+        return len(self.breakpoints)
+
+    def remove_breakpoint(self, address: int) -> int:
+        """Remove a breakpoint. Returns total breakpoint count. Raises KeyError if not found."""
+        try:
+            self.breakpoints.remove(address)
+        except KeyError:
+            raise KeyError(f"No breakpoint at address 0x{address:x}") from None
+        return len(self.breakpoints)
+
+    def list_breakpoints(self) -> list[int]:
+        """Return sorted list of breakpoint addresses."""
+        return sorted(self.breakpoints)
+
+    # -- Stepping ------------------------------------------------------------
+
+    def step(self, address: int | None = None) -> dict:
+        """Execute one instruction. Uses current PC if address is None.
+
+        Returns dict with address, instruction disassembly, and registers.
+        """
+        from capstone import Cs
+
+        if address is None:
+            pc_reg = self.arch.pc_reg
+            address = self.get_register(pc_reg)
+
+        result = self.emulate(address=address, count=1)
+
+        # Disassemble the single instruction that was at `address`.
+        # Read enough bytes for the longest possible instruction (15 for x86).
+        try:
+            code = self.read_memory(address, 16)
+        except Exception:
+            code = self.read_memory(address, 4)  # ARM instructions are 4 bytes
+
+        cs = Cs(self.arch.cs_arch, self.arch.cs_mode)
+        insn = next(cs.disasm(code, address, count=1), None)
+
+        step_result: dict = {
+            "address": address,
+            "registers": result["registers"],
+            "stop_reason": result["stop_reason"],
+        }
+        if insn is not None:
+            step_result["instruction"] = {
+                "mnemonic": insn.mnemonic,
+                "op_str": insn.op_str,
+                "bytes_hex": insn.bytes.hex(),
+                "size": insn.size,
+            }
+        return step_result
+
+    # -- Context save/restore ------------------------------------------------
+
+    def save_context(self, label: str) -> list[str]:
+        """Snapshot all registers under a label. Returns all saved labels."""
+        self._contexts[label] = self.uc.context_save()
+        return sorted(self._contexts.keys())
+
+    def restore_context(self, label: str) -> None:
+        """Restore registers from a saved snapshot. Raises KeyError if not found."""
+        try:
+            ctx = self._contexts[label]
+        except KeyError:
+            raise KeyError(f"No saved context with label {label!r}") from None
+        self.uc.context_restore(ctx)
 
 
 class SessionManager:
