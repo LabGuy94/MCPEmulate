@@ -85,7 +85,7 @@ class EmulationSession:
         "id", "arch", "uc", "mapped_regions", "_insn_count",
         "breakpoints", "_contexts", "_hit_breakpoint",
         "_watchpoints", "_hit_watchpoint",
-        "_trace_enabled", "_trace_log", "_trace_max", "_trace_total",
+        "_trace_enabled", "_trace_log", "_trace_max", "_trace_total", "_trace_capture_regs",
         "_symbols",
         "_memory_snapshots",
         "_saved_traces",
@@ -110,14 +110,15 @@ class EmulationSession:
         self._watchpoints: dict[int, tuple[int, int, str]] = {}  # addr -> (hook_handle, size, access_str)
         self._hit_watchpoint: dict | None = None
         self._trace_enabled: bool = False
-        self._trace_log: deque[tuple[int, bytes]] = deque(maxlen=10_000)
+        self._trace_log: deque[tuple] = deque(maxlen=10_000)
         self._trace_max: int = 10_000
         self._trace_total: int = 0
+        self._trace_capture_regs: bool = False
         self._symbols: dict[str, int] = {}  # name -> address
         # Feature 1: Memory snapshots
         self._memory_snapshots: dict[str, list[tuple[int, int, int, bytes]]] = {}
         # Feature 8: Saved traces
-        self._saved_traces: dict[str, list[tuple[int, bytes]]] = {}
+        self._saved_traces: dict[str, list[tuple]] = {}
         # Feature 4: Syscall hooking
         self._syscall_hook_handle: int | None = None
         self._syscall_log: list[dict] = []
@@ -450,6 +451,64 @@ class EmulationSession:
             names = list(self.arch.register_map)
         return {name.lower(): self.get_register(name) for name in names}
 
+    def get_fp_registers(self, names: list[str] | None = None) -> dict:
+        """Read FP/SIMD registers.
+
+        Returns values as hex strings for vector registers,
+        {"mantissa": "0x...", "exponent": int} for x87, or ints for scalar control registers.
+        Omit *names* for all FP/SIMD registers.
+        """
+        fp_map = self.arch.fp_register_map
+        if not fp_map:
+            raise ValueError(f"No FP/SIMD registers defined for {self.arch.name}")
+        target = names if names else list(fp_map.keys())
+        result: dict = {}
+        for name in target:
+            key = name.lower()
+            entry = fp_map.get(key)
+            if entry is None:
+                raise KeyError(f"Unknown FP/SIMD register {name!r} for {self.arch.name}")
+            uc_const, kind = entry
+            raw = self.uc.reg_read(uc_const)
+            if kind == "x87":
+                mantissa, exp = raw
+                result[key] = {"mantissa": hex(mantissa), "exponent": exp}
+            elif kind == "vec":
+                result[key] = hex(raw)
+            else:  # scalar
+                result[key] = raw
+        return result
+
+    def set_fp_registers(self, values: dict[str, int | str | dict]) -> dict:
+        """Write FP/SIMD registers.
+
+        Accepts hex strings for vector regs, {"mantissa": "0x...", "exponent": int}
+        for x87, or ints for scalar control regs.
+        """
+        fp_map = self.arch.fp_register_map
+        if not fp_map:
+            raise ValueError(f"No FP/SIMD registers defined for {self.arch.name}")
+        updated: dict = {}
+        for name, value in values.items():
+            key = name.lower()
+            entry = fp_map.get(key)
+            if entry is None:
+                raise KeyError(f"Unknown FP/SIMD register {name!r} for {self.arch.name}")
+            uc_const, kind = entry
+            if kind == "x87":
+                if isinstance(value, dict):
+                    m = int(value["mantissa"], 16) if isinstance(value["mantissa"], str) else value["mantissa"]
+                    e = value["exponent"]
+                    self.uc.reg_write(uc_const, (m, e))
+                else:
+                    self.uc.reg_write(uc_const, value)  # assume tuple
+            else:
+                if isinstance(value, str):
+                    value = int(value, 16)
+                self.uc.reg_write(uc_const, value)
+            updated[key] = value
+        return {"updated": updated}
+
     # -- Emulation -----------------------------------------------------------
 
     def emulate(
@@ -483,7 +542,11 @@ class EmulationSession:
                     return
             if self._trace_enabled:
                 insn_bytes = bytes(uc.mem_read(address, size))
-                self._trace_log.append((address, insn_bytes))
+                if self._trace_capture_regs:
+                    regs = self.get_registers()
+                    self._trace_log.append((address, insn_bytes, regs))
+                else:
+                    self._trace_log.append((address, insn_bytes))
                 self._trace_total += 1
 
         hook_handle = self.uc.hook_add(UC_HOOK_CODE, _code_hook)
@@ -507,10 +570,15 @@ class EmulationSession:
                 # that never actually executed. Correct the count.
                 self._insn_count -= 1
                 stop_reason = "breakpoint"
-            elif count > 0 and self._insn_count >= count:
-                stop_reason = "count_exhausted"
             elif self._hit_watchpoint is not None:
                 stop_reason = "watchpoint"
+            elif self._fault_info is not None:
+                stop_reason = "error"
+                fault = self._fault_info
+                access = fault.get("access", fault.get("type", "unknown"))
+                error_detail = f"{access} at 0x{fault.get('address', 0):x}"
+            elif count > 0 and self._insn_count >= count:
+                stop_reason = "count_exhausted"
             if timeout_us > 0 and stop_reason == "completed":
                 elapsed_us = (time.perf_counter() - t0) * 1_000_000
                 if elapsed_us >= timeout_us * 0.99:
@@ -651,12 +719,19 @@ class EmulationSession:
 
     # -- Trace operations -------------------------------------------------------
 
-    def enable_trace(self, max_entries: int = 10_000) -> None:
-        """Enable instruction tracing, clearing any existing log."""
+    def enable_trace(self, max_entries: int = 10_000, capture_registers: bool = False) -> None:
+        """Enable instruction tracing, clearing any existing log.
+
+        Args:
+            max_entries: Maximum trace entries (oldest evicted when full).
+            capture_registers: If True, capture full register state at each traced instruction.
+                Warning: significantly increases memory usage.
+        """
         self._trace_enabled = True
         self._trace_log = deque(maxlen=max_entries)
         self._trace_max = max_entries
         self._trace_total = 0
+        self._trace_capture_regs = capture_registers
 
     def disable_trace(self) -> int:
         """Disable tracing. Log is preserved. Returns entry count."""
@@ -674,7 +749,10 @@ class EmulationSession:
         selected = log_list[offset:offset + limit]
         entries = []
         overflow_offset = self._trace_total - available
-        for i, (addr, raw) in enumerate(selected, start=overflow_offset + offset):
+        for i, trace_entry in enumerate(selected, start=overflow_offset + offset):
+            addr = trace_entry[0]
+            raw = trace_entry[1]
+            regs = trace_entry[2] if len(trace_entry) > 2 else None
             insn = next(cs.disasm(raw, addr, count=1), None)
             entry: dict = {
                 "index": i,
@@ -685,6 +763,8 @@ class EmulationSession:
             if insn is not None:
                 entry["mnemonic"] = insn.mnemonic
                 entry["op_str"] = insn.op_str
+            if regs is not None:
+                entry["registers"] = regs
             symbol = addr_to_symbol.get(addr)
             if symbol is not None:
                 entry["symbol"] = symbol
@@ -1216,9 +1296,20 @@ class EmulationSession:
             raise ValueError(f"Assembly not supported for {self.arch.name} (no Keystone backend)")
         from keystone import Ks
         ks = Ks(self.arch.ks_arch, self.arch.ks_mode)
+        # Normalize line separators: literal \n (two chars) to actual newline.
+        code = code.replace('\\r\\n', '\n').replace('\\n', '\n')
         encoding, stmt_count = ks.asm(code, addr=address)
         if encoding is None:
-            raise ValueError("Assembly produced no output")
+            hint = (
+                "Possible causes: use 'DWORD PTR'/'QWORD PTR' (not lowercase 'dword'/'qword') "
+                "for memory operands; separate statements with ';'"
+            )
+            err_code = getattr(ks, 'errno', None)
+            code_preview = code[:80] + ('...' if len(code) > 80 else '')
+            raise ValueError(
+                f"Assembly produced no output for: {code_preview!r}. "
+                f"Keystone errno={err_code}. {hint}"
+            )
         raw = bytes(encoding)
         result = self.load_binary(raw, address, entry_point=address)
         result["statement_count"] = stmt_count

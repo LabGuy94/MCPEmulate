@@ -432,6 +432,43 @@ def get_registers(session_id: str, names: list[str] | None = None) -> dict:
         return _error(_exc_message(exc))
 
 
+@mcp.tool()
+def get_fp_registers(session_id: str, names: list[str] | None = None) -> dict:
+    """Read FP/SIMD registers (x87, XMM, YMM, NEON Q/D, control registers).
+
+    Returns values as hex strings for vector registers, dicts for x87,
+    or ints for scalar control registers. Omit names for all FP/SIMD registers.
+
+    Args:
+        session_id: The session ID.
+        names: List of FP/SIMD register names. Omit or pass null for all.
+    """
+    try:
+        session = sessions.get(session_id)
+        regs = session.get_fp_registers(names)
+        return {"registers": regs}
+    except Exception as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def set_fp_registers(session_id: str, values: dict) -> dict:
+    """Write FP/SIMD registers.
+
+    Values: hex strings for vector regs, {"mantissa": "0x...", "exponent": int}
+    for x87, or ints for scalar control regs.
+
+    Args:
+        session_id: The session ID.
+        values: Dict mapping register names to values.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.set_fp_registers(values)
+    except Exception as exc:
+        return _error(_exc_message(exc))
+
+
 # -- Emulation ---------------------------------------------------------------
 
 
@@ -579,7 +616,7 @@ def restore_context(session_id: str, label: str) -> dict:
 
 
 @mcp.tool()
-def enable_trace(session_id: str, max_entries: int = 10000) -> dict:
+def enable_trace(session_id: str, max_entries: int = 10000, capture_registers: bool = False) -> dict:
     """Enable execution tracing.
 
     Clears any existing trace log and starts recording.
@@ -587,11 +624,13 @@ def enable_trace(session_id: str, max_entries: int = 10000) -> dict:
     Args:
         session_id: The session ID.
         max_entries: Maximum trace entries to record (default 10000).
+        capture_registers: If True, capture full register state at each traced instruction.
+            Warning: significantly increases memory usage.
     """
     try:
         session = sessions.get(session_id)
-        session.enable_trace(max_entries=max_entries)
-        return {"enabled": True, "max_entries": max_entries}
+        session.enable_trace(max_entries=max_entries, capture_registers=capture_registers)
+        return {"enabled": True, "max_entries": max_entries, "capture_registers": capture_registers}
     except Exception as exc:
         return _error(_exc_message(exc))
 
@@ -880,15 +919,34 @@ def assemble(arch: str, code: str, address: int = 0) -> dict:
         arch: Architecture name. One of: x86_32, x86_64, arm, arm64, mips32, mips32be, riscv32, riscv64.
         code: Assembly source code (e.g. "mov eax, 42; ret").
         address: Base address for assembly (affects relative offsets). Default 0.
+
+    Note: ARM64 relative branches (b.ne, b.eq, etc.) with immediate operands
+    (e.g., `b.ne #-8`) may produce incorrect encodings due to a Keystone limitation.
+    Use labels or absolute target addresses instead of relative byte offsets.
+
+    Memory operand syntax requires uppercase size specifiers with PTR suffix:
+    use `DWORD PTR [rax]` or `QWORD PTR [rbp-8]`, NOT `dword [rax]` or `qword [rbp-8]`.
+    Lowercase forms silently produce no output.
     """
     try:
         arch_cfg = get_arch(arch)
         if arch_cfg.ks_arch is None:
             return _error(f"Assembly is not supported for {arch} (no Keystone backend)")
         ks = Ks(arch_cfg.ks_arch, arch_cfg.ks_mode)
+        # Normalize line separators: literal \n (two chars) to actual newline.
+        code = code.replace('\\r\\n', '\n').replace('\\n', '\n')
         encoding, statement_count = ks.asm(code, addr=address)
         if encoding is None:
-            return _error("Assembly produced no output")
+            hint = (
+                "Possible causes: use 'DWORD PTR'/'QWORD PTR' (not lowercase 'dword'/'qword') "
+                "for memory operands; separate statements with ';'"
+            )
+            err_code = getattr(ks, 'errno', None)
+            code_preview = code[:80] + ('...' if len(code) > 80 else '')
+            return _error(
+                f"Assembly produced no output for: {code_preview!r}",
+                detail=f"Keystone errno={err_code}. {hint}",
+            )
         raw = bytes(encoding)
         return {
             "bytes_hex": raw.hex(),
@@ -1058,6 +1116,8 @@ def assemble_and_load(session_id: str, code: str, address: int) -> dict:
         session_id: The session ID.
         code: Assembly source code.
         address: Base address for assembly and loading.
+
+    See assemble() for syntax notes on ARM64 branches and memory operand sizing.
     """
     try:
         session = sessions.get(session_id)

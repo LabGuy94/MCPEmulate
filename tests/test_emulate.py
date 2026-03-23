@@ -2500,3 +2500,291 @@ class TestDetectArch:
         from mcp_emulate.server import detect_arch
         r = detect_arch(data="00")
         assert "error" in r
+
+
+# ---------------------------------------------------------------------------
+# Fault stop_reason bug fix (Phase 1.1)
+# ---------------------------------------------------------------------------
+
+
+class TestFaultStopReason:
+    """stop_reason must be 'error' when a fault occurs, not 'completed'."""
+
+    def test_fault_sets_stop_reason_error(self, manager: SessionManager) -> None:
+        """ret with zero return address -> fetch_unmapped fault -> stop_reason 'error'."""
+        session = manager.create("x86_64")
+        session.map_memory(0x1000, 0x1000)
+        session.map_memory(0x7F000, 0x1000)  # stack
+        session.set_registers({"rsp": 0x80000})  # top of stack (zeroed -> ret to 0x0)
+        session.write_memory(0x1000, b"\xc3")  # ret
+        result = session.emulate(address=0x1000, stop_address=0x1002, count=10)
+        assert result["stop_reason"] == "error", f"expected 'error', got {result['stop_reason']!r}"
+        assert "fault" in result
+
+    def test_fault_with_count_reports_error_not_exhausted(self, manager: SessionManager) -> None:
+        """When an instruction faults, stop_reason should be 'error' not 'count_exhausted'."""
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, DWORD PTR [0xDEAD0000]")
+        session.write_memory(0x1000, bytes(encoding))
+        result = session.emulate(address=0x1000, count=1)
+        assert result["stop_reason"] == "error", f"expected 'error', got {result['stop_reason']!r}"
+        assert result["fault"]["type"] == "memory"
+
+    def test_normal_completion_still_works(self, manager: SessionManager) -> None:
+        """Non-faulting emulation should still report 'completed' or 'count_exhausted'."""
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("nop; nop")
+        session.write_memory(0x1000, bytes(encoding))
+        result = session.emulate(address=0x1000, count=2)
+        assert result["stop_reason"] == "count_exhausted"
+        assert "fault" not in result
+
+
+# ---------------------------------------------------------------------------
+# Assembly error improvements (Phase 1.2, 1.3)
+# ---------------------------------------------------------------------------
+
+
+class TestAssemblyErrors:
+    """Tests for improved assembly error messages and newline normalization."""
+
+    def test_no_output_includes_hint(self) -> None:
+        from mcp_emulate.server import assemble
+        # Lowercase 'dword' without PTR causes Keystone to produce no output.
+        result = assemble(arch="x86_64", code="mov dword [rax], 42")
+        assert "error" in result
+        # The hint or detail should mention DWORD PTR.
+        combined = result.get("error", "") + result.get("detail", "")
+        assert "DWORD PTR" in combined
+
+    def test_no_output_includes_code_preview(self) -> None:
+        from mcp_emulate.server import assemble
+        result = assemble(arch="x86_64", code="mov dword [rax], 42")
+        assert "error" in result
+        # Error message should include a preview of the code.
+        assert "mov dword" in result["error"]
+
+    def test_newline_separator_works(self) -> None:
+        from mcp_emulate.server import assemble
+        # Literal backslash-n characters as MCP clients might send.
+        result = assemble(arch="x86_64", code="mov rax, 1\\nmov rbx, 2")
+        assert "error" not in result, f"unexpected error: {result}"
+        assert result["statement_count"] == 2
+
+    def test_real_newline_still_works(self) -> None:
+        from mcp_emulate.server import assemble
+        result = assemble(arch="x86_64", code="mov rax, 1\nmov rbx, 2")
+        assert "error" not in result, f"unexpected error: {result}"
+        assert result["statement_count"] == 2
+
+    def test_session_assemble_and_load_newline(self, manager: SessionManager) -> None:
+        """assemble_and_load also normalizes literal \\n."""
+        session = manager.create("x86_64")
+        session.map_memory(0x1000, 0x1000)
+        result = session.assemble_and_load("mov rax, 1\\nnop", 0x1000)
+        assert result["statement_count"] == 2
+
+    def test_session_assemble_and_load_error_includes_hint(self, manager: SessionManager) -> None:
+        """assemble_and_load error should include DWORD PTR hint."""
+        session = manager.create("x86_64")
+        session.map_memory(0x1000, 0x1000)
+        with pytest.raises(ValueError, match="DWORD PTR"):
+            session.assemble_and_load("mov dword [rax], 42", 0x1000)
+
+
+# ---------------------------------------------------------------------------
+# FP/SIMD register support (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class TestFPRegisters:
+    """Tests for FP/SIMD register read/write."""
+
+    def test_get_xmm_registers(self, manager: SessionManager) -> None:
+        session = manager.create("x86_64")
+        result = session.get_fp_registers(["xmm0"])
+        assert "xmm0" in result
+        # Should be a hex string.
+        assert isinstance(result["xmm0"], str)
+        assert result["xmm0"].startswith("0x")
+
+    def test_set_and_get_xmm_roundtrip(self, manager: SessionManager) -> None:
+        session = manager.create("x86_64")
+        value = "0xdeadbeef00000000cafebabe12345678"
+        session.set_fp_registers({"xmm0": value})
+        result = session.get_fp_registers(["xmm0"])
+        assert int(result["xmm0"], 16) == int(value, 16)
+
+    def test_get_all_fp_registers(self, manager: SessionManager) -> None:
+        """Omitting names returns all FP/SIMD registers."""
+        session = manager.create("x86_64")
+        result = session.get_fp_registers()
+        # x86_64 should have xmm0-15, ymm0-15, fp0-7, fpcw, fpsw, fptag, mxcsr.
+        assert "xmm0" in result
+        assert "ymm0" in result
+        assert "fp0" in result
+        assert "mxcsr" in result
+        assert len(result) >= 40  # 8 x87 + 16 xmm + 16 ymm + 4 scalar = 44
+
+    def test_get_arm64_q_registers(self, manager: SessionManager) -> None:
+        session = manager.create("arm64")
+        result = session.get_fp_registers(["q0"])
+        assert "q0" in result
+        assert isinstance(result["q0"], str)
+
+    def test_set_and_get_arm64_q_roundtrip(self, manager: SessionManager) -> None:
+        session = manager.create("arm64")
+        value = "0xdeadbeefcafebabe1234567890abcdef"
+        session.set_fp_registers({"q0": value})
+        result = session.get_fp_registers(["q0"])
+        assert int(result["q0"], 16) == int(value, 16)
+
+    def test_x87_fp_roundtrip(self, manager: SessionManager) -> None:
+        session = manager.create("x86_64")
+        session.set_fp_registers({"fp0": {"mantissa": "0x8000000000000000", "exponent": 16383}})
+        result = session.get_fp_registers(["fp0"])
+        assert result["fp0"]["exponent"] == 16383
+        assert int(result["fp0"]["mantissa"], 16) == 0x8000000000000000
+
+    def test_mxcsr_scalar(self, manager: SessionManager) -> None:
+        session = manager.create("x86_64")
+        session.set_fp_registers({"mxcsr": 0x1F80})
+        result = session.get_fp_registers(["mxcsr"])
+        assert result["mxcsr"] == 0x1F80
+
+    def test_arm32_d_registers(self, manager: SessionManager) -> None:
+        session = manager.create("arm")
+        result = session.get_fp_registers(["d0"])
+        assert "d0" in result
+
+    def test_no_fp_for_mips(self, manager: SessionManager) -> None:
+        session = manager.create("mips32")
+        with pytest.raises(ValueError, match="No FP/SIMD"):
+            session.get_fp_registers()
+
+    def test_no_fp_for_riscv(self, manager: SessionManager) -> None:
+        session = manager.create("riscv64")
+        with pytest.raises(ValueError, match="No FP/SIMD"):
+            session.get_fp_registers()
+
+    def test_invalid_fp_register_name(self, manager: SessionManager) -> None:
+        session = manager.create("x86_64")
+        with pytest.raises(KeyError, match="xmm99"):
+            session.get_fp_registers(["xmm99"])
+
+    def test_case_insensitive_lookup(self, manager: SessionManager) -> None:
+        session = manager.create("x86_64")
+        result = session.get_fp_registers(["XMM0", "MXCSR"])
+        assert "xmm0" in result
+        assert "mxcsr" in result
+
+    def test_tool_get_fp_registers(self) -> None:
+        from mcp_emulate.server import create_emulator, get_fp_registers, destroy_emulator
+        r = create_emulator(arch="x86_64")
+        sid = r["session_id"]
+        try:
+            r = get_fp_registers(session_id=sid, names=["xmm0", "mxcsr"])
+            assert "error" not in r
+            assert "xmm0" in r["registers"]
+            assert "mxcsr" in r["registers"]
+        finally:
+            destroy_emulator(session_id=sid)
+
+    def test_tool_set_fp_registers(self) -> None:
+        from mcp_emulate.server import create_emulator, set_fp_registers, get_fp_registers, destroy_emulator
+        r = create_emulator(arch="x86_64")
+        sid = r["session_id"]
+        try:
+            r = set_fp_registers(session_id=sid, values={"mxcsr": 0x1F80})
+            assert "error" not in r
+            r = get_fp_registers(session_id=sid, names=["mxcsr"])
+            assert r["registers"]["mxcsr"] == 0x1F80
+        finally:
+            destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Trace register snapshots (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+class TestTraceRegisters:
+    """Tests for trace register capture feature."""
+
+    def test_trace_without_registers(self, manager: SessionManager) -> None:
+        """Default trace entries should not include registers."""
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 42; nop")
+        session.write_memory(0x1000, bytes(encoding))
+        session.enable_trace()
+        session.emulate(address=0x1000, count=2)
+        trace = session.get_trace()
+        assert len(trace["entries"]) == 2
+        for entry in trace["entries"]:
+            assert "registers" not in entry
+
+    def test_trace_with_registers(self, manager: SessionManager) -> None:
+        """With capture_registers=True, entries should include register state."""
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 42; nop")
+        session.write_memory(0x1000, bytes(encoding))
+        session.enable_trace(capture_registers=True)
+        session.emulate(address=0x1000, count=2)
+        trace = session.get_trace()
+        assert len(trace["entries"]) == 2
+        for entry in trace["entries"]:
+            assert "registers" in entry
+            assert "eax" in entry["registers"]
+
+    def test_trace_registers_reflect_state_before_insn(self, manager: SessionManager) -> None:
+        """Register snapshot reflects state at the point the instruction executes."""
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # First instruction sets eax=42, second is nop.
+        encoding, _ = ks.asm("mov eax, 42; nop")
+        session.write_memory(0x1000, bytes(encoding))
+        session.enable_trace(capture_registers=True)
+        session.emulate(address=0x1000, count=2)
+        trace = session.get_trace()
+        # First entry: before 'mov eax, 42' executes, eax is 0.
+        assert trace["entries"][0]["registers"]["eax"] == 0
+        # Second entry: after 'mov eax, 42', before nop, eax is 42.
+        assert trace["entries"][1]["registers"]["eax"] == 42
+
+    def test_trace_server_tool_capture_registers(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, enable_trace, map_memory, write_memory,
+            emulate, get_trace, destroy_emulator,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        try:
+            map_memory(session_id=sid, address=0x1000, size=0x1000)
+            write_memory(session_id=sid, address=0x1000, data="90")  # nop
+            r = enable_trace(session_id=sid, capture_registers=True)
+            assert r["capture_registers"] is True
+            emulate(session_id=sid, address=0x1000, count=1)
+            trace = get_trace(session_id=sid)
+            assert len(trace["entries"]) == 1
+            assert "registers" in trace["entries"][0]
+        finally:
+            destroy_emulator(session_id=sid)
