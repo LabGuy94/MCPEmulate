@@ -81,6 +81,8 @@ class ArchConfig:
     register_map: dict[str, int] = field(default_factory=dict)
     pc_reg: str = ""
     sp_reg: str = ""
+    endian: str = "little"  # "little" or "big"
+    nop_bytes: bytes = b"\x90"  # architecture-specific NOP encoding
     # Keystone is optional — RISC-V has no Keystone backend.
     ks_arch: int | None = None
     ks_mode: int | None = None
@@ -247,6 +249,7 @@ ARCHITECTURES: Final[dict[str, ArchConfig]] = {
         sp_reg="sp",
         ks_arch=KS_ARCH_ARM,
         ks_mode=KS_MODE_ARM,
+        nop_bytes=b"\x00\xf0\x20\xe3",
     ),
     "arm64": ArchConfig(
         name="arm64",
@@ -294,6 +297,7 @@ ARCHITECTURES: Final[dict[str, ArchConfig]] = {
         sp_reg="sp",
         ks_arch=KS_ARCH_ARM64,
         ks_mode=KS_MODE_LITTLE_ENDIAN,
+        nop_bytes=b"\x1f\x20\x03\xd5",
     ),
     "mips32": ArchConfig(
         name="mips32",
@@ -306,6 +310,7 @@ ARCHITECTURES: Final[dict[str, ArchConfig]] = {
         sp_reg="sp",
         ks_arch=KS_ARCH_MIPS,
         ks_mode=KS_MODE_MIPS32,
+        nop_bytes=b"\x00\x00\x00\x00",
     ),
     "mips32be": ArchConfig(
         name="mips32be",
@@ -318,6 +323,8 @@ ARCHITECTURES: Final[dict[str, ArchConfig]] = {
         sp_reg="sp",
         ks_arch=KS_ARCH_MIPS,
         ks_mode=KS_MODE_MIPS32 | KS_MODE_BIG_ENDIAN,
+        endian="big",
+        nop_bytes=b"\x00\x00\x00\x00",
     ),
     "riscv32": ArchConfig(
         name="riscv32",
@@ -329,6 +336,7 @@ ARCHITECTURES: Final[dict[str, ArchConfig]] = {
         pc_reg="pc",
         sp_reg="sp",
         # No Keystone backend for RISC-V.
+        nop_bytes=b"\x13\x00\x00\x00",
     ),
     "riscv64": ArchConfig(
         name="riscv64",
@@ -340,6 +348,7 @@ ARCHITECTURES: Final[dict[str, ArchConfig]] = {
         pc_reg="pc",
         sp_reg="sp",
         # No Keystone backend for RISC-V.
+        nop_bytes=b"\x13\x00\x00\x00",
     ),
 }
 

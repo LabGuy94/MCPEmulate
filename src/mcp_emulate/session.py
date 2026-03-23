@@ -10,10 +10,12 @@ from collections import deque, defaultdict
 import operator as _op
 
 from unicorn import (
-    Uc, UC_HOOK_CODE, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE,
+    Uc, UcError, UC_HOOK_CODE, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE,
     UC_MEM_WRITE, UC_MEM_READ,
     UC_PROT_ALL, UC_PROT_READ, UC_PROT_WRITE, UC_PROT_EXEC,
     UC_HOOK_INTR, UC_HOOK_INSN,
+    UC_HOOK_MEM_UNMAPPED, UC_HOOK_INSN_INVALID, UC_HOOK_BLOCK,
+    UC_MEM_READ_UNMAPPED, UC_MEM_WRITE_UNMAPPED, UC_MEM_FETCH_UNMAPPED,
 )
 
 from .architectures import ArchConfig, get_arch
@@ -40,6 +42,8 @@ _CONDITION_OPS = {
     "==": _op.eq, "!=": _op.ne, ">": _op.gt, "<": _op.lt,
     ">=": _op.ge, "<=": _op.le, "&": lambda a, b: bool(a & b),
 }
+
+_NO_BP = object()  # Sentinel: distinguishes 'no breakpoint' from 'breakpoint with None condition'.
 
 
 def parse_perms(perms: str) -> int:
@@ -81,15 +85,16 @@ class EmulationSession:
         "id", "arch", "uc", "mapped_regions", "_insn_count",
         "breakpoints", "_contexts", "_hit_breakpoint",
         "_watchpoints", "_hit_watchpoint",
-        "_trace_enabled", "_trace_log", "_trace_max",
+        "_trace_enabled", "_trace_log", "_trace_max", "_trace_total",
         "_symbols",
-        # Feature 1: Memory snapshots
         "_memory_snapshots",
-        # Feature 8: Saved traces
         "_saved_traces",
-        # Feature 4: Syscall hooking
         "_syscall_hook_handle", "_syscall_log", "_syscall_mode",
         "_syscall_default_return",
+        # Fault hooks (MISSING-1, MISSING-2)
+        "_fault_info",
+        # Code coverage (MISSING-5)
+        "_coverage_enabled", "_coverage_data", "_coverage_hook_handle",
     )
 
     def __init__(self, session_id: str, arch: ArchConfig) -> None:
@@ -107,6 +112,7 @@ class EmulationSession:
         self._trace_enabled: bool = False
         self._trace_log: deque[tuple[int, bytes]] = deque(maxlen=10_000)
         self._trace_max: int = 10_000
+        self._trace_total: int = 0
         self._symbols: dict[str, int] = {}  # name -> address
         # Feature 1: Memory snapshots
         self._memory_snapshots: dict[str, list[tuple[int, int, int, bytes]]] = {}
@@ -117,6 +123,40 @@ class EmulationSession:
         self._syscall_log: list[dict] = []
         self._syscall_mode: str | None = None
         self._syscall_default_return: int = 0
+        # Fault hooks
+        self._fault_info: dict | None = None
+        # Code coverage
+        self._coverage_enabled: bool = False
+        self._coverage_data: dict[int, dict] = {}
+        self._coverage_hook_handle: int | None = None
+
+        # Install permanent fault hooks.
+        self._install_fault_hooks()
+
+    def _install_fault_hooks(self) -> None:
+        """Install memory-fault and invalid-instruction hooks (permanent)."""
+        _access_names = {
+            UC_MEM_READ_UNMAPPED: "read_unmapped",
+            UC_MEM_WRITE_UNMAPPED: "write_unmapped",
+            UC_MEM_FETCH_UNMAPPED: "fetch_unmapped",
+        }
+
+        def _mem_invalid_hook(uc, access, address, size, value, user_data):
+            self._fault_info = {
+                "type": "memory",
+                "access": _access_names.get(access, f"unknown_{access}"),
+                "address": address,
+                "size": size,
+            }
+            return False  # don't try to continue
+
+        def _insn_invalid_hook(uc, user_data):
+            pc = self.get_register(self.arch.pc_reg)
+            self._fault_info = {"type": "invalid_instruction", "address": pc}
+            return False
+
+        self.uc.hook_add(UC_HOOK_MEM_UNMAPPED, _mem_invalid_hook)
+        self.uc.hook_add(UC_HOOK_INSN_INVALID, _insn_invalid_hook)
 
     # -- Memory operations ---------------------------------------------------
 
@@ -193,6 +233,9 @@ class EmulationSession:
 
     def search_memory(self, pattern: bytes, address: int | None = None, size: int | None = None, max_results: int = 100) -> list[int]:
         """Search for byte pattern in memory. Returns list of match addresses."""
+        if address is not None and size is None:
+            raise ValueError("size is required when address is specified")
+
         matches: list[int] = []
         if address is not None and size is not None:
             # Search a specific range.
@@ -279,6 +322,13 @@ class EmulationSession:
                     })
                 else:
                     i += 1
+        if len(a_data) != len(b_data):
+            changes.append({
+                "address": addr,
+                "type": "size_changed",
+                "old_size": len(a_data),
+                "new_size": len(b_data),
+            })
         return {
             "label_a": label_a,
             "label_b": label_b,
@@ -294,8 +344,7 @@ class EmulationSession:
         """Read stack entries from SP, resolve values against symbols."""
         sp = self.get_register(self.arch.sp_reg)
         ptr_size = 8 if "64" in self.arch.name else 4
-        # Determine byte order from architecture mode.
-        byteorder = "big" if "be" in self.arch.name else "little"
+        byteorder = self.arch.endian
         addr_to_symbol = {a: n for n, a in self._symbols.items()}
         entries: list[dict] = []
         for i in range(count):
@@ -397,6 +446,7 @@ class EmulationSession:
         t0 = time.perf_counter()
         self._hit_breakpoint = None
         self._hit_watchpoint = None
+        self._fault_info = None
         self._insn_count = 0
 
         def _code_hook(uc: Uc, address: int, size: int, user_data: object) -> None:
@@ -410,6 +460,7 @@ class EmulationSession:
             if self._trace_enabled:
                 insn_bytes = bytes(uc.mem_read(address, size))
                 self._trace_log.append((address, insn_bytes))
+                self._trace_total += 1
 
         hook_handle = self.uc.hook_add(UC_HOOK_CODE, _code_hook)
         stop_reason = "completed"
@@ -438,7 +489,7 @@ class EmulationSession:
                 stop_reason = "watchpoint"
             if timeout_us > 0 and stop_reason == "completed":
                 elapsed_us = (time.perf_counter() - t0) * 1_000_000
-                if elapsed_us >= timeout_us * 0.9:
+                if elapsed_us >= timeout_us * 0.99:
                     stop_reason = "timeout"
         finally:
             self.uc.hook_del(hook_handle)
@@ -457,6 +508,8 @@ class EmulationSession:
             result["breakpoint_address"] = self._hit_breakpoint
         if self._hit_watchpoint is not None:
             result["watchpoint"] = self._hit_watchpoint
+        if self._fault_info is not None:
+            result["fault"] = self._fault_info
         return result
 
     # -- Breakpoint operations (Feature 6: conditional) ----------------------
@@ -534,13 +587,15 @@ class EmulationSession:
         if address in self._watchpoints:
             self.uc.hook_del(self._watchpoints[address][0])
 
+        byteorder = self.arch.endian
+
         def _wp_callback(uc, acc, addr, sz, value, user_data):
             if acc == UC_MEM_WRITE:
                 actual_value = value
             else:
                 # Unicorn passes value=0 for reads; fetch actual memory content.
                 raw = bytes(uc.mem_read(addr, sz))
-                actual_value = int.from_bytes(raw, byteorder="little")
+                actual_value = int.from_bytes(raw, byteorder=byteorder)
             self._hit_watchpoint = {
                 "address": addr,
                 "access": "write" if acc == UC_MEM_WRITE else "read",
@@ -577,6 +632,7 @@ class EmulationSession:
         self._trace_enabled = True
         self._trace_log = deque(maxlen=max_entries)
         self._trace_max = max_entries
+        self._trace_total = 0
 
     def disable_trace(self) -> int:
         """Disable tracing. Log is preserved. Returns entry count."""
@@ -589,11 +645,12 @@ class EmulationSession:
 
         cs = Cs(self.arch.cs_arch, self.arch.cs_mode)
         addr_to_symbol = {addr: name for name, addr in self._symbols.items()}
-        total = len(self._trace_log)
+        available = len(self._trace_log)
         log_list = list(self._trace_log)
         selected = log_list[offset:offset + limit]
         entries = []
-        for i, (addr, raw) in enumerate(selected, start=offset):
+        overflow_offset = self._trace_total - available
+        for i, (addr, raw) in enumerate(selected, start=overflow_offset + offset):
             insn = next(cs.disasm(raw, addr, count=1), None)
             entry: dict = {
                 "index": i,
@@ -608,7 +665,7 @@ class EmulationSession:
             if symbol is not None:
                 entry["symbol"] = symbol
             entries.append(entry)
-        return {"entries": entries, "total": total, "offset": offset, "limit": limit}
+        return {"entries": entries, "available": available, "total_traced": self._trace_total, "offset": offset, "limit": limit}
 
     # -- Trace diff (Feature 8) -----------------------------------------------
 
@@ -757,7 +814,15 @@ class EmulationSession:
             pc_reg = self.arch.pc_reg
             address = self.get_register(pc_reg)
 
-        result = self.emulate(address=address, count=1)
+        # Temporarily remove breakpoint at current address to avoid immediate re-hit.
+        _saved_bp = _NO_BP
+        if address in self.breakpoints:
+            _saved_bp = self.breakpoints.pop(address)
+        try:
+            result = self.emulate(address=address, count=1)
+        finally:
+            if _saved_bp is not _NO_BP:
+                self.breakpoints[address] = _saved_bp
 
         # Disassemble the single instruction that was at `address`.
         # Read enough bytes for the longest possible instruction (15 for x86).
@@ -836,9 +901,9 @@ class EmulationSession:
             page_size = PAGE_SIZE
         try:
             self.map_memory(page_addr, page_size)
-        except Exception:
+        except UcError:
             pass  # Already mapped — write will still work
-        self.write_memory(address, data)
+        self.uc.mem_write(address, data)
         if entry_point is not None:
             self.set_register(self.arch.pc_reg, entry_point)
         return {
@@ -889,7 +954,7 @@ class EmulationSession:
                     perms = UC_PROT_READ
                 try:
                     self.map_memory(page_addr, map_size, perms)
-                except Exception:
+                except UcError:
                     pass  # overlapping or already mapped
                 content = bytes(segment.content)
                 if content:
@@ -919,7 +984,7 @@ class EmulationSession:
                     perms |= UC_PROT_EXEC
                 try:
                     self.map_memory(page_addr, map_size, perms)
-                except Exception:
+                except UcError:
                     pass
                 content = bytes(section.content)
                 if content:
@@ -953,7 +1018,7 @@ class EmulationSession:
                     perms = UC_PROT_READ
                 try:
                     self.map_memory(page_addr, map_size, perms)
-                except Exception:
+                except UcError:
                     pass
                 content = bytes(segment.content)
                 if content:
@@ -1021,7 +1086,7 @@ class EmulationSession:
         for region in state.get("regions", []):
             try:
                 self.map_memory(region["address"], region["size"], region["perms"])
-            except Exception:
+            except UcError:
                 pass  # already mapped
             self.uc.mem_write(region["address"], bytes.fromhex(region["content_hex"]))
         # Restore registers.
@@ -1039,6 +1104,178 @@ class EmulationSession:
         # Restore symbols.
         for sym in state.get("symbols", []):
             self.add_symbol(sym["name"], sym["address"])
+
+
+    # -- Memory unmap/protect ------------------------------------------------
+
+    def unmap_memory(self, address: int, size: int) -> dict:
+        """Unmap a memory region. Address and size must match an existing mapping."""
+        aligned_size = align_up(size, PAGE_SIZE)
+        if aligned_size == 0:
+            aligned_size = PAGE_SIZE
+        self.uc.mem_unmap(address, aligned_size)
+        self.mapped_regions = [
+            r for r in self.mapped_regions
+            if not (r.address == address and r.size == aligned_size)
+        ]
+        return {"address": address, "size": aligned_size}
+
+    def protect_memory(self, address: int, size: int, perms: int) -> dict:
+        """Change permissions on an existing memory region."""
+        aligned_size = align_up(size, PAGE_SIZE)
+        if aligned_size == 0:
+            aligned_size = PAGE_SIZE
+        self.uc.mem_protect(address, aligned_size, perms)
+        for region in self.mapped_regions:
+            if region.address == address and region.size == aligned_size:
+                region.perms = perms
+                break
+        return {"address": address, "size": aligned_size, "perms": perms}
+
+    # -- Code coverage (MISSING-5) --------------------------------------------
+
+    def enable_coverage(self) -> dict:
+        """Enable basic-block level code coverage tracking."""
+        if self._coverage_hook_handle is not None:
+            self.uc.hook_del(self._coverage_hook_handle)
+        self._coverage_data = {}
+        self._coverage_enabled = True
+
+        def _block_hook(uc, address, size, user_data):
+            entry = self._coverage_data.get(address)
+            if entry is None:
+                self._coverage_data[address] = {"size": size, "count": 1}
+            else:
+                entry["count"] += 1
+
+        self._coverage_hook_handle = self.uc.hook_add(UC_HOOK_BLOCK, _block_hook)
+        return {"enabled": True}
+
+    def disable_coverage(self) -> dict:
+        """Disable code coverage tracking. Data is preserved."""
+        if self._coverage_hook_handle is not None:
+            self.uc.hook_del(self._coverage_hook_handle)
+            self._coverage_hook_handle = None
+        self._coverage_enabled = False
+        return {"enabled": False, "blocks_hit": len(self._coverage_data)}
+
+    def get_coverage(self) -> dict:
+        """Return collected code coverage data."""
+        blocks = sorted(
+            [{"address": addr, **data} for addr, data in self._coverage_data.items()],
+            key=lambda b: b["address"],
+        )
+        return {"blocks": blocks, "total_blocks_hit": len(blocks)}
+
+    # -- Convenience tools -----------------------------------------------------
+
+    def setup_stack(self, address: int = 0x7FFF0000, size: int = 0x10000) -> dict:
+        """Map a stack region and set SP to the top (descending-stack architectures)."""
+        region = self.map_memory(address, size)
+        sp_value = address + region.size
+        self.set_register(self.arch.sp_reg, sp_value)
+        return {"address": address, "size": region.size, "sp": sp_value}
+
+    def assemble_and_load(self, code: str, address: int) -> dict:
+        """Assemble instructions and load into session. Sets PC to address."""
+        if self.arch.ks_arch is None:
+            raise ValueError(f"Assembly not supported for {self.arch.name} (no Keystone backend)")
+        from keystone import Ks
+        ks = Ks(self.arch.ks_arch, self.arch.ks_mode)
+        encoding, stmt_count = ks.asm(code, addr=address)
+        if encoding is None:
+            raise ValueError("Assembly produced no output")
+        raw = bytes(encoding)
+        result = self.load_binary(raw, address, entry_point=address)
+        result["statement_count"] = stmt_count
+        return result
+
+    def diff_context(self, label_a: str, label_b: str) -> dict:
+        """Compare two saved register contexts. Returns only changed registers."""
+        original = self.uc.context_save()
+        try:
+            self.restore_context(label_a)
+            regs_a = self.get_registers()
+            self.restore_context(label_b)
+            regs_b = self.get_registers()
+        finally:
+            self.uc.context_restore(original)
+        changes = {}
+        for name in regs_a:
+            if regs_a[name] != regs_b[name]:
+                changes[name] = {"old": regs_a[name], "new": regs_b[name]}
+        return {
+            "label_a": label_a, "label_b": label_b,
+            "changes": changes, "changed_count": len(changes),
+            "total_registers": len(regs_a),
+        }
+
+    def fill_memory(self, address: int, size: int, pattern: bytes) -> int:
+        """Fill a memory range with a repeating byte pattern. Returns bytes written."""
+        if not pattern:
+            raise ValueError("Pattern must not be empty")
+        data = (pattern * ((size // len(pattern)) + 1))[:size]
+        self.uc.mem_write(address, data)
+        return size
+
+    def nop_out(self, address: int, size: int) -> dict:
+        """Fill a range with architecture-appropriate NOP instructions."""
+        nop = self.arch.nop_bytes
+        if size % len(nop) != 0:
+            raise ValueError(
+                f"Size {size} is not a multiple of NOP size ({len(nop)}) for {self.arch.name}"
+            )
+        data = nop * (size // len(nop))
+        self.uc.mem_write(address, data)
+        return {"address": address, "size": size, "nop_count": size // len(nop)}
+
+    def run_and_diff(
+        self, address: int, stop_address: int = 0,
+        count: int = 0, timeout_us: int = 0,
+    ) -> dict:
+        """Snapshot state, emulate, diff registers and memory in one call."""
+        regs_before = self.get_registers()
+        self.snapshot_memory("__run_and_diff_before")
+        result = self.emulate(
+            address=address, stop_address=stop_address,
+            count=count, timeout_us=timeout_us,
+        )
+        self.snapshot_memory("__run_and_diff_after")
+        mem_diff = self.diff_memory("__run_and_diff_before", "__run_and_diff_after")
+        del self._memory_snapshots["__run_and_diff_before"]
+        del self._memory_snapshots["__run_and_diff_after"]
+        regs_after = result["registers"]
+        reg_changes = {}
+        for name in regs_before:
+            if regs_before[name] != regs_after[name]:
+                reg_changes[name] = {"old": regs_before[name], "new": regs_after[name]}
+        result["memory_diff"] = mem_diff
+        result["register_diff"] = reg_changes
+        result["registers_changed"] = len(reg_changes)
+        return result
+
+    # -- Session cleanup -------------------------------------------------------
+
+    def cleanup(self) -> None:
+        """Release all Unicorn hooks. Called before session destruction."""
+        for addr, (handle, _, _) in self._watchpoints.items():
+            try:
+                self.uc.hook_del(handle)
+            except Exception:
+                pass
+        self._watchpoints.clear()
+        if self._syscall_hook_handle is not None:
+            try:
+                self.uc.hook_del(self._syscall_hook_handle)
+            except Exception:
+                pass
+            self._syscall_hook_handle = None
+        if self._coverage_hook_handle is not None:
+            try:
+                self.uc.hook_del(self._coverage_hook_handle)
+            except Exception:
+                pass
+            self._coverage_hook_handle = None
 
 
 class SessionManager:
@@ -1072,5 +1309,5 @@ class SessionManager:
     def destroy(self, session_id: str) -> None:
         """Destroy and remove a session. Raises KeyError if not found."""
         session = self.get(session_id)
-        # Unicorn doesn't have an explicit close, but dropping the reference suffices.
+        session.cleanup()
         del self._sessions[session_id]

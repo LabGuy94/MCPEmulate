@@ -817,7 +817,7 @@ class TestTrace:
         session.enable_trace()
         session.emulate(address=0x1000, count=3)
         trace = session.get_trace()
-        assert trace["total"] == 3
+        assert trace["available"] == 3
         assert trace["entries"][0]["mnemonic"] == "mov"
         assert trace["entries"][0]["address"] == 0x1000
         assert trace["entries"][2]["index"] == 2
@@ -835,7 +835,7 @@ class TestTrace:
 
         session.emulate(address=0x1000, count=2)
         trace = session.get_trace()
-        assert trace["total"] == 0
+        assert trace["available"] == 0
         assert trace["entries"] == []
 
     def test_trace_with_breakpoint(self, manager: SessionManager) -> None:
@@ -859,7 +859,7 @@ class TestTrace:
 
         trace = session.get_trace()
         # Only 2 instructions traced (3rd was breakpointed, not traced)
-        assert trace["total"] == 2
+        assert trace["available"] == 2
         assert trace["entries"][0]["address"] == 0x1000
         assert trace["entries"][1]["address"] == 0x1000 + 5
 
@@ -878,7 +878,7 @@ class TestTrace:
         session.emulate(address=0x1000, count=5)
 
         trace = session.get_trace(offset=2, limit=2)
-        assert trace["total"] == 5
+        assert trace["available"] == 5
         assert len(trace["entries"]) == 2
         assert trace["entries"][0]["index"] == 2
         assert trace["entries"][1]["index"] == 3
@@ -898,7 +898,7 @@ class TestTrace:
         session.enable_trace(max_entries=3)
         session.emulate(address=0x1000, count=5)
         trace = session.get_trace(limit=10)
-        assert trace["total"] == 3  # capped at 3
+        assert trace["available"] == 3  # capped at 3
         # Ring buffer keeps LAST 3 entries (instructions 3, 4, 5).
         # Instruction 3 is 'mov ecx, 3' at offset 10, 4 is 'mov edx, 4' at offset 15,
         # 5 is 'inc eax' at offset 20.
@@ -918,11 +918,11 @@ class TestTrace:
 
         session.enable_trace()
         session.emulate(address=0x1000, count=2)
-        assert session.get_trace()["total"] == 2
+        assert session.get_trace()["available"] == 2
 
         # Enable again — should clear
         session.enable_trace()
-        assert session.get_trace()["total"] == 0
+        assert session.get_trace()["available"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -952,7 +952,7 @@ class TestServerTraceTools:
 
         r = get_trace(session_id=sid)
         assert "error" not in r
-        assert r["total"] == 2
+        assert r["available"] == 2
         assert r["entries"][0]["mnemonic"] == "mov"
 
         r = disable_trace(session_id=sid)
@@ -1934,3 +1934,474 @@ class TestSessionSerialization:
 
         destroy_emulator(session_id=sid)
         destroy_emulator(session_id=r["session_id"])
+
+
+# ---------------------------------------------------------------------------
+# Bug-fix regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestBugFixes:
+    """Tests for bug fixes."""
+
+    def test_load_binary_into_rx_region(self, manager: SessionManager) -> None:
+        """BUG-1: load_binary should bypass permission check."""
+        session = manager.create("x86_32")
+        # Map as rx (no write permission).
+        from unicorn import UC_PROT_READ, UC_PROT_EXEC
+        session.map_memory(0x1000, 0x1000, UC_PROT_READ | UC_PROT_EXEC)
+        # load_binary should succeed — it uses uc.mem_write() directly.
+        result = session.load_binary(b"\x90\x90\x90", 0x1000)
+        assert result["size"] == 3
+        assert session.read_memory(0x1000, 3) == b"\x90\x90\x90"
+
+    def test_search_memory_address_without_size(self, manager: SessionManager) -> None:
+        """BUG-7: search_memory should raise when address given without size."""
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        with pytest.raises(ValueError, match="size is required"):
+            session.search_memory(b"\x00", address=0x1000)
+
+    def test_watchpoint_big_endian(self, manager: SessionManager) -> None:
+        """BUG-2: watchpoint should report correct value for big-endian."""
+        from keystone import Ks
+        arch = get_arch("mips32be")
+        session = manager.create("mips32be")
+        session.map_memory(0x1000, 0x1000)
+        # lui loads upper 16 bits, so lui $t1, 2 gives $t1 = 0x20000.
+        # Map data region at 0x20000.
+        session.map_memory(0x20000, 0x1000)
+        # Write big-endian 0x00000042 at 0x20000.
+        session.uc.mem_write(0x20000, b"\x00\x00\x00\x42")
+        session.add_watchpoint(0x20000, size=4, access="r")
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # lui $t1, 2 => $t1 = 0x20000; lw $t0, 0($t1) => read [0x20000]
+        code = "lui $t1, 2; lw $t0, 0($t1)"
+        encoding, _ = ks.asm(code, addr=0x1000)
+        session.uc.mem_write(0x1000, bytes(encoding))
+        result = session.emulate(address=0x1000, count=10)
+        assert result["stop_reason"] == "watchpoint"
+        # Value should be 0x42 (read as big-endian).
+        assert result["watchpoint"]["value"] == 0x42
+
+    def test_step_at_breakpoint(self, manager: SessionManager) -> None:
+        """BUG-5: step() at a breakpoint address should not get stuck."""
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2")
+        session.write_memory(0x1000, bytes(encoding))
+        # Set breakpoint at first instruction.
+        session.add_breakpoint(0x1000)
+        # Step should execute the instruction and not report breakpoint.
+        result = session.step(0x1000)
+        assert result["stop_reason"] != "breakpoint"
+        assert result["address"] == 0x1000
+        # Breakpoint should still be in place.
+        assert 0x1000 in session.breakpoints
+
+    def test_diff_memory_size_change(self, manager: SessionManager) -> None:
+        """BUG-3: diff_memory should report size differences."""
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.snapshot_memory("before")
+        # Unmap and remap with different size.
+        session.unmap_memory(0x1000, 0x1000)
+        session.map_memory(0x1000, 0x2000)
+        session.snapshot_memory("after")
+        diff = session.diff_memory("before", "after")
+        # The old 0x1000 region (4096 bytes) is gone, replaced by 0x1000 region (8192 bytes).
+        # Since the address is the same but size changed, we should see size_changed.
+        size_changes = [c for c in diff["changes"] if c.get("type") == "size_changed"]
+        assert len(size_changes) == 1
+        assert size_changes[0]["old_size"] == 0x1000
+        assert size_changes[0]["new_size"] == 0x2000
+
+    def test_trace_overflow_tracking(self, manager: SessionManager) -> None:
+        """BUG-8: trace should track total instructions even when deque overflows."""
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2; mov ecx, 3; mov edx, 4; inc eax")
+        session.write_memory(0x1000, bytes(encoding))
+        session.enable_trace(max_entries=2)
+        session.emulate(address=0x1000, count=5)
+        trace = session.get_trace()
+        assert trace["available"] == 2
+        assert trace["total_traced"] == 5
+        # Indices should be absolute: 3 and 4 (last 2 of 5).
+        assert trace["entries"][0]["index"] == 3
+        assert trace["entries"][1]["index"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Fault hooks
+# ---------------------------------------------------------------------------
+
+
+class TestFaultHooks:
+    """Tests for structured fault reporting."""
+
+    def test_memory_read_unmapped(self, manager: SessionManager) -> None:
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # Read from unmapped address 0xDEAD0000.
+        encoding, _ = ks.asm("mov eax, [0xDEAD0000]")
+        session.write_memory(0x1000, bytes(encoding))
+        result = session.emulate(address=0x1000, count=1)
+        assert "fault" in result
+        assert result["fault"]["type"] == "memory"
+        assert result["fault"]["access"] == "read_unmapped"
+        assert result["fault"]["address"] == 0xDEAD0000
+
+    def test_memory_write_unmapped(self, manager: SessionManager) -> None:
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov dword ptr [0xDEAD0000], eax")
+        session.write_memory(0x1000, bytes(encoding))
+        result = session.emulate(address=0x1000, count=1)
+        assert "fault" in result
+        assert result["fault"]["type"] == "memory"
+        assert result["fault"]["access"] == "write_unmapped"
+
+    def test_no_fault_on_normal_execution(self, manager: SessionManager) -> None:
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 42")
+        session.write_memory(0x1000, bytes(encoding))
+        result = session.emulate(address=0x1000, count=1)
+        assert "fault" not in result
+
+
+# ---------------------------------------------------------------------------
+# Unmap memory
+# ---------------------------------------------------------------------------
+
+
+class TestUnmapMemory:
+    def test_unmap_basic(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.write_memory(0x1000, b"\xde\xad")
+        result = session.unmap_memory(0x1000, 0x1000)
+        assert result["address"] == 0x1000
+        assert result["size"] == 0x1000
+        assert len(session.mapped_regions) == 0
+        # Reading should now fail.
+        with pytest.raises(Exception):
+            session.read_memory(0x1000, 2)
+
+    def test_unmap_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory, unmap_memory,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+        r = unmap_memory(session_id=sid, address=0x1000, size=0x1000)
+        assert "error" not in r
+        assert r["size"] == 0x1000
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Protect memory
+# ---------------------------------------------------------------------------
+
+
+class TestProtectMemory:
+    def test_protect_removes_write(self, manager: SessionManager) -> None:
+        from unicorn import UC_PROT_READ, UC_PROT_EXEC
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)  # rwx by default
+        session.write_memory(0x1000, b"\xaa\xbb")
+        session.protect_memory(0x1000, 0x1000, UC_PROT_READ | UC_PROT_EXEC)
+        # Read should still work.
+        assert session.read_memory(0x1000, 2) == b"\xaa\xbb"
+        # Write (via write_memory with perm check) should fail.
+        with pytest.raises(ValueError):
+            session.write_memory(0x1000, b"\xcc")
+
+    def test_protect_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory, protect_memory,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+        r = protect_memory(session_id=sid, address=0x1000, size=0x1000, perms="rx")
+        assert "error" not in r
+        assert r["perms"] == 5  # UC_PROT_READ | UC_PROT_EXEC
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Coverage
+# ---------------------------------------------------------------------------
+
+
+class TestCoverage:
+    def test_coverage_basic(self, manager: SessionManager) -> None:
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2; mov ecx, 3")
+        session.write_memory(0x1000, bytes(encoding))
+        session.enable_coverage()
+        session.emulate(address=0x1000, count=3)
+        cov = session.get_coverage()
+        assert cov["total_blocks_hit"] >= 1
+        assert len(cov["blocks"]) >= 1
+        # First block should be at 0x1000.
+        assert cov["blocks"][0]["address"] == 0x1000
+        assert cov["blocks"][0]["count"] >= 1
+
+    def test_coverage_disable(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        result = session.enable_coverage()
+        assert result["enabled"] is True
+        result = session.disable_coverage()
+        assert result["enabled"] is False
+
+    def test_coverage_tools(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory, write_memory,
+            assemble, emulate, enable_coverage, disable_coverage, get_coverage,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+        asm = assemble(arch="x86_32", code="mov eax, 1; mov ebx, 2", address=0x1000)
+        write_memory(session_id=sid, address=0x1000, data=asm["bytes_hex"])
+        r = enable_coverage(session_id=sid)
+        assert "error" not in r
+        emulate(session_id=sid, address=0x1000, count=2)
+        r = get_coverage(session_id=sid)
+        assert "error" not in r
+        assert r["total_blocks_hit"] >= 1
+        r = disable_coverage(session_id=sid)
+        assert "error" not in r
+        assert r["enabled"] is False
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Convenience tools (session level)
+# ---------------------------------------------------------------------------
+
+
+class TestConvenienceTools:
+    def test_setup_stack(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        result = session.setup_stack(0x7FFF0000, 0x10000)
+        assert result["address"] == 0x7FFF0000
+        assert result["size"] == 0x10000
+        assert result["sp"] == 0x7FFF0000 + 0x10000
+        # SP register should be set.
+        assert session.get_register("esp") == result["sp"]
+
+    def test_assemble_and_load(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        result = session.assemble_and_load("mov eax, 42; inc eax", 0x1000)
+        assert result["address"] == 0x1000
+        assert result["entry_point"] == 0x1000
+        assert result["statement_count"] == 2
+        # PC should be set to 0x1000.
+        assert session.get_register("eip") == 0x1000
+
+    def test_assemble_and_load_no_keystone(self, manager: SessionManager) -> None:
+        session = manager.create("riscv32")
+        with pytest.raises(ValueError, match="no Keystone backend"):
+            session.assemble_and_load("nop", 0x1000)
+
+    def test_diff_context(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.set_register("eax", 10)
+        session.save_context("before")
+        session.set_register("eax", 20)
+        session.set_register("ebx", 99)
+        session.save_context("after")
+        diff = session.diff_context("before", "after")
+        assert diff["changed_count"] >= 2
+        assert "eax" in diff["changes"]
+        assert diff["changes"]["eax"]["old"] == 10
+        assert diff["changes"]["eax"]["new"] == 20
+        assert "ebx" in diff["changes"]
+
+    def test_fill_memory(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        written = session.fill_memory(0x1000, 8, b"\xab\xcd")
+        assert written == 8
+        assert session.read_memory(0x1000, 8) == b"\xab\xcd" * 4
+
+    def test_fill_memory_empty_pattern(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        with pytest.raises(ValueError, match="Pattern must not be empty"):
+            session.fill_memory(0x1000, 8, b"")
+
+    def test_nop_out(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.write_memory(0x1000, b"\xcc" * 4)
+        result = session.nop_out(0x1000, 4)
+        assert result["nop_count"] == 4
+        assert session.read_memory(0x1000, 4) == b"\x90" * 4
+
+    def test_nop_out_arm(self, manager: SessionManager) -> None:
+        session = manager.create("arm")
+        session.map_memory(0x1000, 0x1000)
+        result = session.nop_out(0x1000, 8)
+        assert result["nop_count"] == 2
+        nop = b"\x00\xf0\x20\xe3"
+        assert session.read_memory(0x1000, 8) == nop * 2
+
+    def test_nop_out_bad_size(self, manager: SessionManager) -> None:
+        session = manager.create("arm")
+        session.map_memory(0x1000, 0x1000)
+        with pytest.raises(ValueError, match="not a multiple"):
+            session.nop_out(0x1000, 3)
+
+    def test_run_and_diff(self, manager: SessionManager) -> None:
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.map_memory(0x2000, 0x1000)
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # mov eax, 42; mov dword ptr [0x2000], eax
+        encoding, _ = ks.asm("mov eax, 42; mov dword ptr [0x2000], eax")
+        session.write_memory(0x1000, bytes(encoding))
+        result = session.run_and_diff(address=0x1000, count=2)
+        assert result["stop_reason"] == "count_exhausted"
+        assert "register_diff" in result
+        assert "eax" in result["register_diff"]
+        assert result["register_diff"]["eax"]["new"] == 42
+        assert "memory_diff" in result
+        assert result["registers_changed"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Convenience server tools
+# ---------------------------------------------------------------------------
+
+
+class TestConvenienceServerTools:
+    def test_setup_stack_tool(self) -> None:
+        from mcp_emulate.server import create_emulator, destroy_emulator, setup_stack
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        r = setup_stack(session_id=sid)
+        assert "error" not in r
+        assert r["sp"] > r["address"]
+        destroy_emulator(session_id=sid)
+
+    def test_assemble_and_load_tool(self) -> None:
+        from mcp_emulate.server import create_emulator, destroy_emulator, assemble_and_load
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        r = assemble_and_load(session_id=sid, code="mov eax, 1; mov ebx, 2", address=0x1000)
+        assert "error" not in r
+        assert r["statement_count"] == 2
+        destroy_emulator(session_id=sid)
+
+    def test_diff_context_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, set_registers,
+            save_context, diff_context,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        set_registers(session_id=sid, values={"eax": 1})
+        save_context(session_id=sid, label="a")
+        set_registers(session_id=sid, values={"eax": 99})
+        save_context(session_id=sid, label="b")
+        r = diff_context(session_id=sid, label_a="a", label_b="b")
+        assert "error" not in r
+        assert r["changed_count"] >= 1
+        assert "eax" in r["changes"]
+        destroy_emulator(session_id=sid)
+
+    def test_fill_memory_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory, fill_memory, read_memory,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+        r = fill_memory(session_id=sid, address=0x1000, size=8, pattern="abcd")
+        assert "error" not in r
+        r = read_memory(session_id=sid, address=0x1000, size=8)
+        assert r["data"] == "abcdabcdabcdabcd"
+        destroy_emulator(session_id=sid)
+
+    def test_nop_out_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory, nop_out, read_memory,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+        r = nop_out(session_id=sid, address=0x1000, size=4)
+        assert "error" not in r
+        assert r["nop_count"] == 4
+        r = read_memory(session_id=sid, address=0x1000, size=4)
+        assert r["data"] == "90909090"
+        destroy_emulator(session_id=sid)
+
+    def test_run_and_diff_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            write_memory, assemble, run_and_diff,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+        asm = assemble(arch="x86_32", code="mov eax, 42", address=0x1000)
+        write_memory(session_id=sid, address=0x1000, data=asm["bytes_hex"])
+        r = run_and_diff(session_id=sid, address=0x1000, count=1)
+        assert "error" not in r
+        assert "register_diff" in r
+        assert "memory_diff" in r
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# ArchConfig fields
+# ---------------------------------------------------------------------------
+
+
+class TestArchConfigFields:
+    """Tests for new ArchConfig fields."""
+
+    def test_endian_field(self) -> None:
+        assert get_arch("x86_32").endian == "little"
+        assert get_arch("mips32be").endian == "big"
+        assert get_arch("arm64").endian == "little"
+
+    def test_nop_bytes_field(self) -> None:
+        assert get_arch("x86_32").nop_bytes == b"\x90"
+        assert get_arch("arm").nop_bytes == b"\x00\xf0\x20\xe3"
+        assert get_arch("riscv32").nop_bytes == b"\x13\x00\x00\x00"
+
+    def test_all_archs_have_nop_bytes(self) -> None:
+        for name, arch in ARCHITECTURES.items():
+            assert len(arch.nop_bytes) > 0, f"{name} has empty nop_bytes"
+            assert len(arch.nop_bytes) in (1, 4), f"{name} has unexpected NOP size {len(arch.nop_bytes)}"

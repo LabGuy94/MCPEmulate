@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import json
 from typing import Any
 
 from capstone import Cs
@@ -91,7 +90,7 @@ def create_emulator(arch: str) -> dict:
     """Create a new CPU emulation session.
 
     Args:
-        arch: Architecture name. One of: x86_32, x86_64, arm, arm64.
+        arch: Architecture name. One of: x86_32, x86_64, arm, arm64, mips32, mips32be, riscv32, riscv64.
 
     Returns a dict with session_id and arch.
     """
@@ -878,7 +877,7 @@ def assemble(arch: str, code: str, address: int = 0) -> dict:
     """Assemble instructions into machine code using Keystone.
 
     Args:
-        arch: Architecture name (x86_32, x86_64, arm, arm64).
+        arch: Architecture name. One of: x86_32, x86_64, arm, arm64, mips32, mips32be, riscv32, riscv64.
         code: Assembly source code (e.g. "mov eax, 42; ret").
         address: Base address for assembly (affects relative offsets). Default 0.
     """
@@ -909,7 +908,7 @@ def disassemble(
     """Disassemble machine code into instructions using Capstone.
 
     Args:
-        arch: Architecture name (x86_32, x86_64, arm, arm64).
+        arch: Architecture name. One of: x86_32, x86_64, arm, arm64, mips32, mips32be, riscv32, riscv64.
         data: Machine code as hex string or base64.
         address: Base address for disassembly. Default 0.
         encoding: "hex" (default) or "base64".
@@ -932,6 +931,287 @@ def disassemble(
             )
         return {"instructions": instructions}
     except (ValueError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+
+# -- Memory management tools -------------------------------------------------
+
+
+@mcp.tool()
+def unmap_memory(session_id: str, address: int, size: int) -> dict:
+    """Unmap a memory region.
+
+    Address and size must match an existing mapping.
+
+    Args:
+        session_id: The session ID.
+        address: Start address (must be page-aligned).
+        size: Region size in bytes.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.unmap_memory(address, size)
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def protect_memory(session_id: str, address: int, size: int, perms: str = "rwx") -> dict:
+    """Change permissions on an existing memory region.
+
+    Args:
+        session_id: The session ID.
+        address: Start address (must be page-aligned).
+        size: Region size in bytes.
+        perms: Permission string combining 'r', 'w', 'x'. Default "rwx".
+    """
+    try:
+        session = sessions.get(session_id)
+        perm_bits = parse_perms(perms)
+        return session.protect_memory(address, size, perm_bits)
+    except (KeyError, ValueError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+# -- Code coverage tools -----------------------------------------------------
+
+
+@mcp.tool()
+def enable_coverage(session_id: str) -> dict:
+    """Enable basic-block level code coverage tracking.
+
+    Clears any existing coverage data and starts recording.
+
+    Args:
+        session_id: The session ID.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.enable_coverage()
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def disable_coverage(session_id: str) -> dict:
+    """Disable code coverage tracking.
+
+    The coverage data is preserved for inspection via get_coverage.
+
+    Args:
+        session_id: The session ID.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.disable_coverage()
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def get_coverage(session_id: str) -> dict:
+    """Get collected code coverage data.
+
+    Returns list of basic blocks hit with execution counts.
+
+    Args:
+        session_id: The session ID.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.get_coverage()
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+# -- Convenience tools -------------------------------------------------------
+
+
+@mcp.tool()
+def setup_stack(session_id: str, address: int = 0x7FFF0000, size: int = 0x10000) -> dict:
+    """Map a stack region and set SP to the top.
+
+    For descending-stack architectures (all supported architectures).
+
+    Args:
+        session_id: The session ID.
+        address: Stack region base address. Default 0x7FFF0000.
+        size: Stack size in bytes. Default 0x10000 (64KB).
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.setup_stack(address, size)
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def assemble_and_load(session_id: str, code: str, address: int) -> dict:
+    """Assemble instructions and load them into the session in one call.
+
+    Sets PC to the given address.
+
+    Args:
+        session_id: The session ID.
+        code: Assembly source code.
+        address: Base address for assembly and loading.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.assemble_and_load(code, address)
+    except (KeyError, ValueError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def diff_context(session_id: str, label_a: str, label_b: str) -> dict:
+    """Compare two saved register contexts.
+
+    Returns only the registers that differ between the two snapshots.
+
+    Args:
+        session_id: The session ID.
+        label_a: First snapshot label.
+        label_b: Second snapshot label.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.diff_context(label_a, label_b)
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def fill_memory(session_id: str, address: int, size: int, pattern: str = "00") -> dict:
+    """Fill a memory range with a repeating byte pattern.
+
+    Args:
+        session_id: The session ID.
+        address: Start address.
+        size: Number of bytes to fill.
+        pattern: Hex string of bytes to repeat (e.g. "deadbeef"). Default "00".
+    """
+    try:
+        session = sessions.get(session_id)
+        raw = _decode_data(pattern, "hex")
+        bytes_written = session.fill_memory(address, size, raw)
+        return {"address": address, "size": bytes_written, "pattern_hex": pattern}
+    except (KeyError, ValueError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def nop_out(session_id: str, address: int, size: int) -> dict:
+    """Patch a memory range with architecture-appropriate NOP instructions.
+
+    Size must be a multiple of the architecture's NOP instruction size.
+
+    Args:
+        session_id: The session ID.
+        address: Start address.
+        size: Number of bytes to NOP out.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.nop_out(address, size)
+    except (KeyError, ValueError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def detect_arch(data: str, encoding: str = "hex") -> dict:
+    """Detect the architecture of an executable binary (ELF, PE, or Mach-O).
+
+    Returns the MCPEmulate architecture name that should be used to create a session.
+    No session required.
+
+    Args:
+        data: Binary data as hex string or base64.
+        encoding: \"hex\" (default) or \"base64\".
+    """
+    try:
+        import lief
+        raw = _decode_data(data, encoding)
+        binary = lief.parse(list(raw))
+        if binary is None:
+            return _error("Failed to parse binary")
+
+        detected_arch = None
+        fmt = "unknown"
+        endian = "little"
+
+        if isinstance(binary, lief.ELF.Binary):
+            fmt = "elf"
+            machine = binary.header.machine_type
+            is_64 = binary.header.identity_class == lief.ELF.Header.CLASS.ELF64
+            endian_val = binary.header.identity_data
+            endian = "big" if endian_val == lief.ELF.Header.ELF_DATA.MSB else "little"
+            _elf_map = {
+                lief.ELF.ARCH.i386: "x86_32",
+                lief.ELF.ARCH.x86_64: "x86_64",
+                lief.ELF.ARCH.ARM: "arm",
+                lief.ELF.ARCH.AARCH64: "arm64",
+                lief.ELF.ARCH.MIPS: "mips32be" if endian == "big" else "mips32",
+                lief.ELF.ARCH.RISCV: "riscv64" if is_64 else "riscv32",
+            }
+            detected_arch = _elf_map.get(machine)
+
+        elif isinstance(binary, lief.PE.Binary):
+            fmt = "pe"
+            machine = binary.header.machine
+            _pe_map = {
+                lief.PE.Header.MACHINE_TYPES.I386: "x86_32",
+                lief.PE.Header.MACHINE_TYPES.AMD64: "x86_64",
+                lief.PE.Header.MACHINE_TYPES.ARM: "arm",
+                lief.PE.Header.MACHINE_TYPES.ARM64: "arm64",
+            }
+            detected_arch = _pe_map.get(machine)
+
+        elif isinstance(binary, lief.MachO.Binary):
+            fmt = "macho"
+            cpu_type = binary.header.cpu_type
+            _macho_map = {
+                lief.MachO.Header.CPU_TYPE.x86: "x86_32",
+                lief.MachO.Header.CPU_TYPE.x86_64: "x86_64",
+                lief.MachO.Header.CPU_TYPE.ARM: "arm",
+                lief.MachO.Header.CPU_TYPE.ARM64: "arm64",
+            }
+            detected_arch = _macho_map.get(cpu_type)
+
+        if detected_arch is None:
+            return _error(f"Could not determine architecture from {fmt} binary")
+
+        return {"arch": detected_arch, "format": fmt, "endian": endian}
+    except (ValueError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def run_and_diff(
+    session_id: str, address: int, stop_address: int = 0,
+    count: int = 0, timeout_ms: int = 30000,
+) -> dict:
+    """Snapshot state, emulate, and return combined register and memory diffs.
+
+    Equivalent to snapshot + emulate + snapshot + diff in one call.
+
+    Args:
+        session_id: The session ID.
+        address: Address to begin execution.
+        stop_address: Address to stop at (exclusive). Default 0.
+        count: Maximum instructions to execute. Default 0 (unlimited).
+        timeout_ms: Timeout in milliseconds (max 60000). Default 30000.
+    """
+    try:
+        session = sessions.get(session_id)
+        timeout_ms = min(max(timeout_ms, 0), _MAX_TIMEOUT_MS)
+        timeout_us = timeout_ms * 1000
+        return session.run_and_diff(
+            address=address, stop_address=stop_address,
+            count=count, timeout_us=timeout_us,
+        )
+    except (KeyError, ValueError, Exception) as exc:
         return _error(_exc_message(exc))
 
 

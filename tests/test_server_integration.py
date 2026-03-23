@@ -126,7 +126,7 @@ def main() -> None:
         tools = resp["result"]["tools"]
         tool_names = sorted(t["name"] for t in tools)
         print(f"  Server exposes {len(tools)} tools: {', '.join(tool_names)}")
-        check("tool count is 41", len(tools) == 41, f"got {len(tools)}")
+        check("tool count is 53", len(tools) == 53, f"got {len(tools)}")
 
         expected_tools = sorted([
             "create_emulator", "destroy_emulator",
@@ -150,6 +150,11 @@ def main() -> None:
             "hook_syscall", "unhook_syscall", "get_syscall_log",
             "load_executable",
             "export_session", "import_session",
+            # Iteration 7 — new tools
+            "unmap_memory", "protect_memory",
+            "enable_coverage", "disable_coverage", "get_coverage",
+            "setup_stack", "assemble_and_load", "diff_context",
+            "fill_memory", "nop_out", "detect_arch", "run_and_diff",
         ])
         check("all expected tools present", tool_names == expected_tools,
               f"missing: {set(expected_tools) - set(tool_names)}, extra: {set(tool_names) - set(expected_tools)}")
@@ -349,7 +354,7 @@ def main() -> None:
 
         r = client.call_tool("get_trace", {"session_id": sid})
         check("get_trace succeeds", "error" not in r)
-        check("trace total=3", r.get("total") == 3, str(r.get("total")))
+        check("trace available=3", r.get("available") == 3, str(r.get("available")))
         check("trace entry 0 is mov", r["entries"][0].get("mnemonic") == "mov")
         check("trace entry 0 address", r["entries"][0].get("address") == 0x1000)
 
@@ -531,8 +536,81 @@ def main() -> None:
             sid2 = r["session_id"]
             client.call_tool("destroy_emulator", {"session_id": sid2})
 
-        # ── Phase 23: Cleanup ────────────────────────────────────────────
-        print("\n=== Phase 23: Cleanup ===")
+        # ── Phase 23: New memory management tools ──────────────────────
+        print("\n=== Phase 23: New memory management tools ===")
+
+        # Map, write, unmap, verify error on read
+        client.call_tool("map_memory", {"session_id": sid, "address": 0x50000, "size": 0x1000})
+        client.call_tool("write_memory", {"session_id": sid, "address": 0x50000, "data": "aabbccdd"})
+        r = client.call_tool("unmap_memory", {"session_id": sid, "address": 0x50000, "size": 0x1000})
+        check("unmap_memory succeeds", "error" not in r)
+        check("unmap_memory size", r.get("size") == 0x1000)
+
+        # Map + protect
+        client.call_tool("map_memory", {"session_id": sid, "address": 0x60000, "size": 0x1000})
+        r = client.call_tool("protect_memory", {"session_id": sid, "address": 0x60000, "size": 0x1000, "perms": "rx"})
+        check("protect_memory succeeds", "error" not in r)
+        check("protect_memory perms", r.get("perms") == 5)  # rx = 1|4
+
+        # ── Phase 24: Coverage tools ─────────────────────────────────────
+        print("\n=== Phase 24: Coverage tools ===")
+
+        r = client.call_tool("enable_coverage", {"session_id": sid})
+        check("enable_coverage", "error" not in r and r.get("enabled") is True)
+
+        # Emulate something to generate coverage
+        client.call_tool("map_memory", {"session_id": sid, "address": 0x70000, "size": 0x1000})
+        asm = client.call_tool("assemble", {"arch": "x86_32", "code": "mov eax, 1; nop", "address": 0x70000})
+        client.call_tool("write_memory", {"session_id": sid, "address": 0x70000, "data": asm["bytes_hex"]})
+        client.call_tool("emulate", {"session_id": sid, "address": 0x70000, "count": 2})
+
+        r = client.call_tool("get_coverage", {"session_id": sid})
+        check("get_coverage has blocks", r.get("total_blocks_hit", 0) >= 1)
+
+        r = client.call_tool("disable_coverage", {"session_id": sid})
+        check("disable_coverage", "error" not in r)
+
+        # ── Phase 25: Convenience tools ──────────────────────────────────
+        print("\n=== Phase 25: Convenience tools ===")
+
+        # setup_stack
+        r = client.call_tool("setup_stack", {"session_id": sid})
+        check("setup_stack succeeds", "error" not in r and "sp" in r)
+
+        # assemble_and_load
+        r = client.call_tool("assemble_and_load", {"session_id": sid, "code": "mov eax, 42; inc eax", "address": 0x80000})
+        check("assemble_and_load succeeds", "error" not in r and r.get("statement_count") == 2)
+
+        # diff_context
+        client.call_tool("set_registers", {"session_id": sid, "values": {"eax": 10}})
+        client.call_tool("save_context", {"session_id": sid, "label": "ctx_a"})
+        client.call_tool("set_registers", {"session_id": sid, "values": {"eax": 99}})
+        client.call_tool("save_context", {"session_id": sid, "label": "ctx_b"})
+        r = client.call_tool("diff_context", {"session_id": sid, "label_a": "ctx_a", "label_b": "ctx_b"})
+        check("diff_context finds changes", "error" not in r and r.get("changed_count", 0) >= 1)
+
+        # fill_memory
+        r = client.call_tool("fill_memory", {"session_id": sid, "address": 0x70000, "size": 8, "pattern": "aa"})
+        check("fill_memory succeeds", "error" not in r)
+
+        # nop_out
+        r = client.call_tool("nop_out", {"session_id": sid, "address": 0x70000, "size": 4})
+        check("nop_out succeeds", "error" not in r and r.get("nop_count") == 4)
+
+        # run_and_diff
+        asm = client.call_tool("assemble", {"arch": "x86_32", "code": "mov eax, 55", "address": 0x70000})
+        client.call_tool("write_memory", {"session_id": sid, "address": 0x70000, "data": asm["bytes_hex"]})
+        r = client.call_tool("run_and_diff", {"session_id": sid, "address": 0x70000, "count": 1})
+        check("run_and_diff succeeds", "error" not in r and "register_diff" in r and "memory_diff" in r)
+
+        # detect_arch (standalone, no session needed)
+        # Use a minimal ELF header for x86_32.
+        # Not easy to construct in integration test; skip actual binary test.
+        r = client.call_tool("detect_arch", {"data": "00"})
+        check("detect_arch handles invalid binary", "error" in r)
+
+        # ── Phase 26: Cleanup ────────────────────────────────────────────
+        print("\n=== Phase 26: Cleanup ===")
 
         r = client.call_tool("destroy_emulator", {"session_id": sid})
         check("destroy_emulator succeeds", r.get("success") is True)
