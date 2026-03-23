@@ -954,3 +954,132 @@ class TestServerTraceTools:
         assert r["entries"] == 2
 
         destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Symbols (Iteration 5)
+# ---------------------------------------------------------------------------
+
+class TestSymbols:
+    def test_add_remove_symbol(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        total = session.add_symbol("main", 0x1000)
+        assert total == 1
+        syms = session.list_symbols()
+        assert len(syms) == 1
+        assert syms[0]["name"] == "main"
+        assert syms[0]["address"] == 0x1000
+        total = session.remove_symbol("main")
+        assert total == 0
+        assert session.list_symbols() == []
+
+    def test_overwrite_symbol(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.add_symbol("entry", 0x1000)
+        session.add_symbol("entry", 0x2000)  # overwrite
+        syms = session.list_symbols()
+        assert len(syms) == 1
+        assert syms[0]["address"] == 0x2000
+
+    def test_remove_nonexistent_raises(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        with pytest.raises(KeyError, match="No symbol"):
+            session.remove_symbol("nope")
+
+    def test_list_symbols_sorted(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.add_symbol("zebra", 0x3000)
+        session.add_symbol("alpha", 0x1000)
+        session.add_symbol("mid", 0x2000)
+        syms = session.list_symbols()
+        names = [s["name"] for s in syms]
+        assert names == ["alpha", "mid", "zebra"]
+
+
+# ---------------------------------------------------------------------------
+# Load Binary (Iteration 5)
+# ---------------------------------------------------------------------------
+
+class TestLoadBinary:
+    def test_load_binary_basic(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        code = b"\xb8\x2a\x00\x00\x00"  # mov eax, 42
+        result = session.load_binary(code, address=0x1000, entry_point=0x1000)
+        assert result["address"] == 0x1000
+        assert result["size"] == 5
+        assert result["entry_point"] == 0x1000
+        # Verify memory was written.
+        assert session.read_memory(0x1000, 5) == code
+        # Verify PC was set.
+        assert session.get_register("eip") == 0x1000
+
+    def test_load_binary_auto_map(self, manager: SessionManager) -> None:
+        """Load at address not yet mapped — auto-map should handle it."""
+        session = manager.create("x86_32")
+        code = b"\x90\x90\xc3"  # nop; nop; ret
+        result = session.load_binary(code, address=0x5000)
+        assert result["size"] == 3
+        # Memory should be readable.
+        assert session.read_memory(0x5000, 3) == code
+
+    def test_load_binary_no_entry_point(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        # Set PC to a known value first.
+        session.map_memory(0x1000, 0x1000)
+        session.set_register("eip", 0xDEAD)
+        code = b"\x90\xc3"
+        result = session.load_binary(code, address=0x2000)
+        assert result["entry_point"] is None
+        # PC should be unchanged.
+        assert session.get_register("eip") == 0xDEAD
+
+
+# ---------------------------------------------------------------------------
+# Server tools — Symbols & Load (Iteration 5)
+# ---------------------------------------------------------------------------
+
+class TestServerIteration5Tools:
+    def test_symbol_tool_roundtrip(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator,
+            add_symbol, remove_symbol, list_symbols,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+
+        r = add_symbol(session_id=sid, name="main", address=0x1000)
+        assert "error" not in r
+        assert r["total_symbols"] == 1
+
+        r = list_symbols(session_id=sid)
+        assert r["count"] == 1
+        assert r["symbols"][0]["name"] == "main"
+
+        r = remove_symbol(session_id=sid, name="main")
+        assert "error" not in r
+        assert r["total_symbols"] == 0
+
+        destroy_emulator(session_id=sid)
+
+    def test_load_binary_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator,
+            load_binary, read_memory,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+
+        # Load hex-encoded "mov eax, 42" at 0x1000
+        code_hex = "b82a000000"
+        r = load_binary(session_id=sid, data=code_hex, address=0x1000, entry_point=0x1000)
+        assert "error" not in r
+        assert r["size"] == 5
+        assert r["entry_point"] == 0x1000
+
+        # Verify data was written.
+        r = read_memory(session_id=sid, address=0x1000, size=5)
+        assert r["data"] == code_hex
+
+        destroy_emulator(session_id=sid)

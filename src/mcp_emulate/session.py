@@ -58,7 +58,7 @@ class MemoryRegion:
 class EmulationSession:
     """Wraps a single Unicorn engine instance with bookkeeping."""
 
-    __slots__ = ("id", "arch", "uc", "mapped_regions", "_insn_count", "breakpoints", "_contexts", "_hit_breakpoint", "_watchpoints", "_hit_watchpoint", "_trace_enabled", "_trace_log", "_trace_max")
+    __slots__ = ("id", "arch", "uc", "mapped_regions", "_insn_count", "breakpoints", "_contexts", "_hit_breakpoint", "_watchpoints", "_hit_watchpoint", "_trace_enabled", "_trace_log", "_trace_max", "_symbols")
 
     def __init__(self, session_id: str, arch: ArchConfig) -> None:
         self.id = session_id
@@ -74,6 +74,7 @@ class EmulationSession:
         self._trace_enabled: bool = False
         self._trace_log: list[tuple[int, bytes]] = []  # (address, insn_bytes)
         self._trace_max: int = 10_000
+        self._symbols: dict[str, int] = {}  # name -> address
 
     # -- Memory operations ---------------------------------------------------
 
@@ -402,6 +403,51 @@ class EmulationSession:
         except KeyError:
             raise KeyError(f"No saved context with label {label!r}") from None
         self.uc.context_restore(ctx)
+
+    # -- Symbol operations ------------------------------------------------------
+
+    def add_symbol(self, name: str, address: int) -> int:
+        """Associate a name with an address. Overwrites if exists. Returns total count."""
+        self._symbols[name] = address
+        return len(self._symbols)
+
+    def remove_symbol(self, name: str) -> int:
+        """Remove a symbol. Returns total count. Raises KeyError if not found."""
+        try:
+            del self._symbols[name]
+        except KeyError:
+            raise KeyError(f"No symbol with name {name!r}") from None
+        return len(self._symbols)
+
+    def list_symbols(self) -> list[dict]:
+        """Return list of symbols sorted by name."""
+        return sorted(
+            [{"name": n, "address": a} for n, a in self._symbols.items()],
+            key=lambda s: s["name"],
+        )
+
+    # -- Load helper ------------------------------------------------------------
+
+    def load_binary(self, data: bytes, address: int, entry_point: int | None = None) -> dict:
+        """Load binary data: auto-map memory, write data, optionally set PC."""
+        # Auto-map: align address down to page boundary, size up.
+        page_addr = address & ~(PAGE_SIZE - 1)
+        end = address + len(data)
+        page_size = align_up(end - page_addr, PAGE_SIZE)
+        if page_size == 0:
+            page_size = PAGE_SIZE
+        try:
+            self.map_memory(page_addr, page_size)
+        except Exception:
+            pass  # Already mapped — write will still work
+        self.write_memory(address, data)
+        if entry_point is not None:
+            self.set_register(self.arch.pc_reg, entry_point)
+        return {
+            "address": address,
+            "size": len(data),
+            "entry_point": entry_point,
+        }
 
 
 class SessionManager:

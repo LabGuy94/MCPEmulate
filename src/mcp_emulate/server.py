@@ -536,6 +536,87 @@ def get_trace(session_id: str, offset: int = 0, limit: int = 100) -> dict:
         return _error(str(exc))
 
 
+# -- Symbol tools ---------------------------------------------------------------
+
+
+@mcp.tool()
+def add_symbol(session_id: str, name: str, address: int) -> dict:
+    """Associate a symbolic name with a memory address.
+
+    Overwrites if the name already exists.
+
+    Args:
+        session_id: The session ID.
+        name: Symbol name.
+        address: Memory address.
+    """
+    try:
+        session = sessions.get(session_id)
+        total = session.add_symbol(name, address)
+        return {"name": name, "address": address, "total_symbols": total}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def remove_symbol(session_id: str, name: str) -> dict:
+    """Remove a symbol.
+
+    Args:
+        session_id: The session ID.
+        name: The symbol name to remove.
+    """
+    try:
+        session = sessions.get(session_id)
+        total = session.remove_symbol(name)
+        return {"name": name, "total_symbols": total}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def list_symbols(session_id: str) -> dict:
+    """List all symbols.
+
+    Args:
+        session_id: The session ID.
+    """
+    try:
+        session = sessions.get(session_id)
+        syms = session.list_symbols()
+        return {"symbols": syms, "count": len(syms)}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+# -- Load tools -----------------------------------------------------------------
+
+
+@mcp.tool()
+def load_binary(
+    session_id: str, data: str, address: int,
+    entry_point: int | None = None, encoding: str = "hex",
+) -> dict:
+    """Load binary data into the emulator.
+
+    Auto-maps memory, writes data, and optionally sets the program counter.
+
+    Args:
+        session_id: The session ID.
+        data: Binary data as hex string or base64.
+        address: Destination address.
+        entry_point: Optional address to set the PC to.
+        encoding: "hex" (default) or "base64".
+    """
+    try:
+        session = sessions.get(session_id)
+        raw = _decode_data(data, encoding)
+        return session.load_binary(raw, address, entry_point=entry_point)
+    except (KeyError, ValueError, Exception) as exc:
+        return _error(str(exc))
+
+
+
 # -- Standalone tools (no session needed) ------------------------------------
 
 
