@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from typing import Any
 
 from capstone import Cs
@@ -264,6 +265,83 @@ def search_memory(
         return _error(_exc_message(exc))
 
 
+# -- Memory snapshot tools (Feature 1) ----------------------------------------
+
+
+@mcp.tool()
+def snapshot_memory(session_id: str, label: str) -> dict:
+    """Save a snapshot of all mapped memory under a label.
+
+    Overwrites if the label already exists.
+
+    Args:
+        session_id: The session ID.
+        label: A name for this memory snapshot.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.snapshot_memory(label)
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def diff_memory(session_id: str, label_a: str, label_b: str) -> dict:
+    """Compare two memory snapshots and return changed byte ranges.
+
+    Args:
+        session_id: The session ID.
+        label_a: First snapshot label.
+        label_b: Second snapshot label.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.diff_memory(label_a, label_b)
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+# -- Stack view tool (Feature 2) ---------------------------------------------
+
+
+@mcp.tool()
+def get_stack(session_id: str, count: int = 16) -> dict:
+    """Read stack entries from the current stack pointer.
+
+    Resolves values against registered symbols.
+
+    Args:
+        session_id: The session ID.
+        count: Number of stack entries to read (default 16, max 256).
+    """
+    try:
+        session = sessions.get(session_id)
+        count = min(count, 256)
+        return session.get_stack(count=count)
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+# -- Memory map visualization tool (Feature 5) ------------------------------
+
+
+@mcp.tool()
+def memory_map(session_id: str) -> dict:
+    """Produce a /proc/self/maps-style layout of the address space.
+
+    Shows regions with permissions, gaps, and symbol annotations.
+
+    Args:
+        session_id: The session ID.
+    """
+    try:
+        session = sessions.get(session_id)
+        text = session.memory_map()
+        return {"map": text, "region_count": len(session.mapped_regions)}
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
 # -- Watchpoint tools --------------------------------------------------------
 
 
@@ -398,20 +476,21 @@ def emulate(
 
 
 @mcp.tool()
-def add_breakpoint(session_id: str, address: int) -> dict:
+def add_breakpoint(session_id: str, address: int, condition: str | None = None) -> dict:
     """Add a breakpoint at the given address.
 
-    Idempotent \u2014 adding the same address twice is a no-op.
+    Idempotent — adding the same address twice is a no-op.
 
     Args:
         session_id: The session ID.
         address: The address to break at.
+        condition: Optional condition expression (e.g. "eax == 42", "rax > 0x1000 and rcx != 0").
     """
     try:
         session = sessions.get(session_id)
-        total = session.add_breakpoint(address)
-        return {"address": address, "total_breakpoints": total}
-    except (KeyError, Exception) as exc:
+        total = session.add_breakpoint(address, condition=condition)
+        return {"address": address, "condition": condition, "total_breakpoints": total}
+    except (KeyError, ValueError, Exception) as exc:
         return _error(_exc_message(exc))
 
 
@@ -553,6 +632,99 @@ def get_trace(session_id: str, offset: int = 0, limit: int = 100) -> dict:
         return _error(_exc_message(exc))
 
 
+# -- Trace diff tools (Feature 8) -------------------------------------------
+
+
+@mcp.tool()
+def save_trace(session_id: str, label: str) -> dict:
+    """Save the current trace log under a label.
+
+    Overwrites if the label already exists.
+
+    Args:
+        session_id: The session ID.
+        label: A name for this saved trace.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.save_trace(label)
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def diff_trace(session_id: str, label_a: str, label_b: str) -> dict:
+    """Compare two saved traces instruction-by-instruction.
+
+    Returns the common prefix length, divergence point, and up to 50 differing entries.
+
+    Args:
+        session_id: The session ID.
+        label_a: First trace label.
+        label_b: Second trace label.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.diff_trace(label_a, label_b)
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+# -- Syscall hooking tools (Feature 4) ---------------------------------------
+
+
+@mcp.tool()
+def hook_syscall(session_id: str, mode: str = "skip", default_return: int = 0) -> dict:
+    """Install a syscall hook to intercept system calls.
+
+    Modes:
+        skip: Log the syscall and return default_return (continue execution).
+        stop: Log the syscall and stop emulation.
+
+    Idempotent — replaces existing hook.
+
+    Args:
+        session_id: The session ID.
+        mode: Hook mode — "skip" (default) or "stop".
+        default_return: Return value for skip mode (default 0).
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.hook_syscall(mode=mode, default_return=default_return)
+    except (KeyError, ValueError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def unhook_syscall(session_id: str) -> dict:
+    """Remove the syscall hook.
+
+    Args:
+        session_id: The session ID.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.unhook_syscall()
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def get_syscall_log(session_id: str, offset: int = 0, limit: int = 100) -> dict:
+    """Get recorded syscall invocations with pagination.
+
+    Args:
+        session_id: The session ID.
+        offset: Start index (default 0).
+        limit: Max entries to return (default 100).
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.get_syscall_log(offset=offset, limit=limit)
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
 # -- Symbol tools ---------------------------------------------------------------
 
 
@@ -633,6 +805,70 @@ def load_binary(
         return _error(_exc_message(exc))
 
 
+@mcp.tool()
+def load_executable(
+    session_id: str, data: str, base_address: int = 0, encoding: str = "hex",
+) -> dict:
+    """Load an executable binary (ELF, PE, or Mach-O) into the emulator.
+
+    Auto-detects format. Maps segments with correct permissions,
+    sets PC to entry point, registers symbols.
+
+    Args:
+        session_id: The session ID.
+        data: Binary data as hex string or base64.
+        base_address: Optional base address offset. Default 0.
+        encoding: "hex" (default) or "base64".
+    """
+    try:
+        session = sessions.get(session_id)
+        raw = _decode_data(data, encoding)
+        return session.load_executable(raw, base_address=base_address)
+    except (KeyError, ValueError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+# -- Session serialization tools (Feature 9) ---------------------------------
+
+
+@mcp.tool()
+def export_session(session_id: str) -> dict:
+    """Export full session state (memory, registers, breakpoints, symbols) to JSON.
+
+    Args:
+        session_id: The session ID.
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.export_state()
+    except (KeyError, Exception) as exc:
+        return _error(_exc_message(exc))
+
+
+@mcp.tool()
+def import_session(arch: str, state: dict) -> dict:
+    """Import session state into a new session.
+
+    Creates a new session for the given architecture and restores state from export.
+
+    Args:
+        arch: Architecture name (must match the exported state's arch).
+        state: The state dict from export_session.
+    """
+    try:
+        session = sessions.create(arch)
+        session.import_state(state)
+        return {
+            "session_id": session.id,
+            "arch": session.arch.name,
+            "regions_restored": len(state.get("regions", [])),
+            "breakpoints_restored": len(state.get("breakpoints", [])),
+            "watchpoints_restored": len(state.get("watchpoints", [])),
+            "symbols_restored": len(state.get("symbols", [])),
+        }
+    except (KeyError, ValueError, RuntimeError, Exception) as exc:
+        return _error(_exc_message(exc))
+
 
 # -- Standalone tools (no session needed) ------------------------------------
 
@@ -648,6 +884,8 @@ def assemble(arch: str, code: str, address: int = 0) -> dict:
     """
     try:
         arch_cfg = get_arch(arch)
+        if arch_cfg.ks_arch is None:
+            return _error(f"Assembly is not supported for {arch} (no Keystone backend)")
         ks = Ks(arch_cfg.ks_arch, arch_cfg.ks_mode)
         encoding, statement_count = ks.asm(code, addr=address)
         if encoding is None:
@@ -701,8 +939,15 @@ def disassemble(
 
 
 def main() -> None:
-    """Run the MCP server on stdio transport."""
-    mcp.run(transport="stdio")
+    """Run the MCP server. Defaults to stdio; supports --transport sse|streamable-http."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="mcp-emulate", description="MCP CPU emulation server")
+    parser.add_argument(
+        "--transport", choices=["stdio", "sse", "streamable-http"],
+        default="stdio", help="Transport protocol (default: stdio)",
+    )
+    args = parser.parse_args()
+    mcp.run(transport=args.transport)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ class MCPClient:
             [sys.executable, "-m", "mcp_emulate.server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
             encoding="utf-8",
         )
@@ -126,7 +126,7 @@ def main() -> None:
         tools = resp["result"]["tools"]
         tool_names = sorted(t["name"] for t in tools)
         print(f"  Server exposes {len(tools)} tools: {', '.join(tool_names)}")
-        check("tool count is 29", len(tools) == 29, f"got {len(tools)}")
+        check("tool count is 41", len(tools) == 41, f"got {len(tools)}")
 
         expected_tools = sorted([
             "create_emulator", "destroy_emulator",
@@ -142,6 +142,14 @@ def main() -> None:
             "enable_trace", "disable_trace", "get_trace",
             # Iteration 5
             "add_symbol", "remove_symbol", "list_symbols", "load_binary",
+            # Iteration 6 — new features
+            "snapshot_memory", "diff_memory",
+            "get_stack",
+            "memory_map",
+            "save_trace", "diff_trace",
+            "hook_syscall", "unhook_syscall", "get_syscall_log",
+            "load_executable",
+            "export_session", "import_session",
         ])
         check("all expected tools present", tool_names == expected_tools,
               f"missing: {set(expected_tools) - set(tool_names)}, extra: {set(tool_names) - set(expected_tools)}")
@@ -255,7 +263,7 @@ def main() -> None:
         check("breakpoint count=1", r.get("total_breakpoints") == 1)
 
         r = client.call_tool("list_breakpoints", {"session_id": sid})
-        check("list_breakpoints", r.get("breakpoints") == [bp_addr])
+        check("list_breakpoints", r.get("breakpoints") == [{"address": bp_addr, "condition": None}])
 
         r = client.call_tool("emulate", {"session_id": sid, "address": 0x1000, "count": 100})
         check("emulate hits breakpoint", r.get("stop_reason") == "breakpoint")
@@ -396,17 +404,135 @@ def main() -> None:
         check("loaded code runs", r.get("stop_reason") == "completed")
         check("loaded code eax=99", r.get("registers", {}).get("eax") == 99)
 
-        # ── Phase 15: Multi-arch smoke ───────────────────────────────────
-        print("\n=== Phase 15: Multi-arch smoke ===")
+        # ── Phase 15: Memory snapshots & diff (Feature 1) ─────────────
+        print("\n=== Phase 15: Memory snapshots & diff ===")
 
-        for arch in ["x86_64", "arm", "arm64"]:
+        r = client.call_tool("snapshot_memory", {"session_id": sid, "label": "snap_before"})
+        check("snapshot_memory succeeds", "error" not in r)
+        check("snapshot label", r.get("label") == "snap_before")
+
+        # Modify memory and take another snapshot.
+        client.call_tool("write_memory", {"session_id": sid, "address": 0x1000, "data": "ff" * 4})
+        r = client.call_tool("snapshot_memory", {"session_id": sid, "label": "snap_after"})
+        check("snapshot after succeeds", "error" not in r)
+
+        r = client.call_tool("diff_memory", {"session_id": sid, "label_a": "snap_before", "label_b": "snap_after"})
+        check("diff_memory succeeds", "error" not in r)
+        check("diff finds changes", r.get("change_count", 0) >= 1)
+
+        # ── Phase 16: Stack view (Feature 2) ───────────────────────
+        print("\n=== Phase 16: Stack view ===")
+
+        r = client.call_tool("get_stack", {"session_id": sid, "count": 4})
+        check("get_stack succeeds", "error" not in r)
+        check("get_stack has entries", r.get("count", 0) >= 0)
+
+        # ── Phase 17: Memory map (Feature 5) ───────────────────────
+        print("\n=== Phase 17: Memory map ===")
+
+        r = client.call_tool("memory_map", {"session_id": sid})
+        check("memory_map succeeds", "error" not in r)
+        check("memory_map has regions", r.get("region_count", 0) >= 1)
+        check("memory_map text output", len(r.get("map", "")) > 0)
+
+        # ── Phase 18: Trace diff (Feature 8) ──────────────────────
+        print("\n=== Phase 18: Trace diff ===")
+
+        asm = client.call_tool("assemble", {"arch": "x86_32", "code": "mov eax, 1; mov ebx, 2", "address": 0x1000})
+        client.call_tool("write_memory", {"session_id": sid, "address": 0x1000, "data": asm["bytes_hex"]})
+        client.call_tool("enable_trace", {"session_id": sid})
+        client.call_tool("emulate", {"session_id": sid, "address": 0x1000, "count": 2})
+        r = client.call_tool("save_trace", {"session_id": sid, "label": "trace_a"})
+        check("save_trace succeeds", "error" not in r)
+        check("save_trace entries", r.get("entries") == 2)
+
+        # Run again, identical
+        client.call_tool("enable_trace", {"session_id": sid})
+        client.call_tool("emulate", {"session_id": sid, "address": 0x1000, "count": 2})
+        client.call_tool("save_trace", {"session_id": sid, "label": "trace_b"})
+
+        r = client.call_tool("diff_trace", {"session_id": sid, "label_a": "trace_a", "label_b": "trace_b"})
+        check("diff_trace succeeds", "error" not in r)
+        check("diff_trace common_prefix", r.get("common_prefix") == 2)
+
+        # ── Phase 19: Conditional breakpoints (Feature 6) ───────────
+        print("\n=== Phase 19: Conditional breakpoints ===")
+
+        # Remove old breakpoints first.
+        bps = client.call_tool("list_breakpoints", {"session_id": sid})
+        for bp in bps.get("breakpoints", []):
+            client.call_tool("remove_breakpoint", {"session_id": sid, "address": bp["address"]})
+
+        asm = client.call_tool("assemble", {"arch": "x86_32", "code": "mov eax, 1; mov ebx, 2", "address": 0x1000})
+        client.call_tool("write_memory", {"session_id": sid, "address": 0x1000, "data": asm["bytes_hex"]})
+
+        bp_addr2 = 0x1000 + 5  # second instruction
+        r = client.call_tool("add_breakpoint", {"session_id": sid, "address": bp_addr2, "condition": "eax == 1"})
+        check("conditional bp added", "error" not in r)
+        check("conditional bp condition", r.get("condition") == "eax == 1")
+
+        r = client.call_tool("emulate", {"session_id": sid, "address": 0x1000, "count": 10})
+        check("conditional bp fires", r.get("stop_reason") == "breakpoint")
+
+        client.call_tool("remove_breakpoint", {"session_id": sid, "address": bp_addr2})
+
+        # ── Phase 20: Syscall hooking (Feature 4) ─────────────────
+        print("\n=== Phase 20: Syscall hooking ===")
+
+        # Create an x86_64 session for syscall testing.
+        r64 = client.call_tool("create_emulator", {"arch": "x86_64"})
+        sid64 = r64["session_id"]
+        client.call_tool("map_memory", {"session_id": sid64, "address": 0x1000, "size": 0x1000})
+
+        asm64 = client.call_tool("assemble", {"arch": "x86_64", "code": "mov rax, 1; syscall", "address": 0x1000})
+        client.call_tool("write_memory", {"session_id": sid64, "address": 0x1000, "data": asm64["bytes_hex"]})
+
+        r = client.call_tool("hook_syscall", {"session_id": sid64, "mode": "skip", "default_return": 42})
+        check("hook_syscall succeeds", "error" not in r)
+
+        client.call_tool("emulate", {"session_id": sid64, "address": 0x1000, "count": 2})
+
+        r = client.call_tool("get_syscall_log", {"session_id": sid64})
+        check("get_syscall_log succeeds", "error" not in r)
+        check("syscall logged", r.get("total", 0) >= 1)
+
+        r = client.call_tool("unhook_syscall", {"session_id": sid64})
+        check("unhook_syscall succeeds", r.get("unhooked") is True)
+
+        client.call_tool("destroy_emulator", {"session_id": sid64})
+
+        # ── Phase 21: Session export/import (Feature 9) ────────────
+        print("\n=== Phase 21: Session export/import ===")
+
+        r = client.call_tool("export_session", {"session_id": sid})
+        check("export_session succeeds", "error" not in r)
+        check("export has version", r.get("version") == 1)
+        check("export has arch", r.get("arch") == "x86_32")
+        check("export has regions", len(r.get("regions", [])) >= 1)
+
+        exported_state = r
+        r = client.call_tool("import_session", {"arch": "x86_32", "state": exported_state})
+        check("import_session succeeds", "error" not in r)
+        check("import returns session_id", "session_id" in r)
+        imported_sid = r["session_id"]
+
+        # Verify imported session has memory.
+        r = client.call_tool("list_regions", {"session_id": imported_sid})
+        check("imported session has regions", r.get("count", 0) >= 1)
+
+        client.call_tool("destroy_emulator", {"session_id": imported_sid})
+
+        # ── Phase 22: Multi-arch smoke (includes new arches) ────────
+        print("\n=== Phase 22: Multi-arch smoke ===")
+
+        for arch in ["x86_64", "arm", "arm64", "mips32", "mips32be", "riscv32", "riscv64"]:
             r = client.call_tool("create_emulator", {"arch": arch})
             check(f"create {arch}", "session_id" in r)
             sid2 = r["session_id"]
             client.call_tool("destroy_emulator", {"session_id": sid2})
 
-        # ── Phase 16: Cleanup ────────────────────────────────────────────
-        print("\n=== Phase 16: Cleanup ===")
+        # ── Phase 23: Cleanup ────────────────────────────────────────────
+        print("\n=== Phase 23: Cleanup ===")
 
         r = client.call_tool("destroy_emulator", {"session_id": sid})
         check("destroy_emulator succeeds", r.get("success") is True)

@@ -350,15 +350,15 @@ class TestBreakpoints:
         session = manager.create("x86_32")
         assert session.add_breakpoint(0x1000) == 1
         assert session.add_breakpoint(0x2000) == 2
-        assert session.list_breakpoints() == [0x1000, 0x2000]
+        assert session.list_breakpoints() == [{"address": 0x1000, "condition": None}, {"address": 0x2000, "condition": None}]
         assert session.remove_breakpoint(0x1000) == 1
-        assert session.list_breakpoints() == [0x2000]
+        assert session.list_breakpoints() == [{"address": 0x2000, "condition": None}]
 
     def test_add_duplicate_is_idempotent(self, manager: SessionManager) -> None:
         session = manager.create("x86_32")
         assert session.add_breakpoint(0x1000) == 1
         assert session.add_breakpoint(0x1000) == 1  # no change
-        assert session.list_breakpoints() == [0x1000]
+        assert session.list_breakpoints() == [{"address": 0x1000, "condition": None}]
 
     def test_remove_nonexistent_raises(self, manager: SessionManager) -> None:
         session = manager.create("x86_32")
@@ -570,7 +570,7 @@ class TestServerBreakpointTools:
         assert r["total_breakpoints"] == 1
 
         r = list_breakpoints(session_id=sid)
-        assert r["breakpoints"] == [0x1000]
+        assert r["breakpoints"] == [{"address": 0x1000, "condition": None}]
         assert r["count"] == 1
 
         r = remove_breakpoint(session_id=sid, address=0x1000)
@@ -1345,3 +1345,592 @@ class TestServerBugFixes:
         assert isinstance(r["elapsed_ms"], float)
 
         destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Feature 7: MIPS and RISC-V Architectures
+# ---------------------------------------------------------------------------
+
+class TestNewArchitectures:
+    """Feature 7: MIPS32, MIPS32BE, RISC-V 32/64."""
+
+    @pytest.mark.parametrize("arch_name", ["mips32", "mips32be", "riscv32", "riscv64"])
+    def test_new_arch_has_required_fields(self, arch_name: str) -> None:
+        cfg = get_arch(arch_name)
+        assert cfg.name == arch_name
+        assert cfg.pc_reg in cfg.register_map
+        assert cfg.sp_reg in cfg.register_map
+
+    @pytest.mark.parametrize("arch_name", ["mips32", "mips32be", "riscv32", "riscv64"])
+    def test_new_arch_session_creation(self, manager: SessionManager, arch_name: str) -> None:
+        session = manager.create(arch_name)
+        assert session.arch.name == arch_name
+        # Can read/write registers.
+        regs = session.get_registers()
+        assert "pc" in regs
+        assert "sp" in regs
+
+    @pytest.mark.parametrize("arch_name", ["mips32", "mips32be", "riscv32", "riscv64"])
+    def test_new_arch_memory_map_and_rw(self, manager: SessionManager, arch_name: str) -> None:
+        session = manager.create(arch_name)
+        session.map_memory(0x10000, 0x1000)
+        session.write_memory(0x10000, b"\xde\xad\xbe\xef")
+        data = session.read_memory(0x10000, 4)
+        assert data == b"\xde\xad\xbe\xef"
+
+    def test_mips32_assemble_and_run(self, manager: SessionManager) -> None:
+        """MIPS32 has full Keystone support — assemble and execute."""
+        from keystone import Ks
+        arch = get_arch("mips32")
+        session = manager.create("mips32")
+        session.map_memory(0x10000, 0x1000)
+
+        # addiu $v0, $zero, 42  -> sets v0 to 42
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("addiu $v0, $zero, 42")
+        code = bytes(encoding)
+        session.write_memory(0x10000, code)
+        result = session.emulate(address=0x10000, count=1)
+        assert result["stop_reason"] == "count_exhausted"
+        assert result["registers"]["v0"] == 42
+
+    def test_riscv_no_assemble(self) -> None:
+        """RISC-V has no Keystone backend — assemble tool returns error."""
+        from mcp_emulate.server import assemble
+        r = assemble(arch="riscv32", code="addi x1, x0, 1")
+        assert "error" in r
+        assert "not supported" in r["error"].lower() or "no Keystone" in r["error"]
+
+    def test_riscv_disassemble(self) -> None:
+        """RISC-V disassembly works via Capstone."""
+        from mcp_emulate.server import disassemble
+        # addi x1, x0, 1 = 0x00100093 in RISC-V 32 little-endian
+        r = disassemble(arch="riscv32", data="93001000")
+        assert "error" not in r
+        assert len(r["instructions"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Feature 1: Memory Snapshots and Diff
+# ---------------------------------------------------------------------------
+
+class TestMemorySnapshots:
+    def test_snapshot_and_diff_no_changes(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.write_memory(0x1000, b"\x41\x42\x43\x44")
+
+        session.snapshot_memory("before")
+        session.snapshot_memory("after")
+        diff = session.diff_memory("before", "after")
+        assert diff["change_count"] == 0
+        assert diff["changes"] == []
+
+    def test_snapshot_and_diff_with_changes(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.write_memory(0x1000, b"\x41\x42\x43\x44")
+        session.snapshot_memory("before")
+
+        session.write_memory(0x1000, b"\xFF\x42\x43\xEE")
+        session.snapshot_memory("after")
+
+        diff = session.diff_memory("before", "after")
+        assert diff["change_count"] >= 1
+        # Byte 0 changed from 0x41->0xFF, byte 3 changed from 0x44->0xEE.
+        change_addrs = [c["address"] for c in diff["changes"]]
+        assert 0x1000 in change_addrs  # first byte changed
+
+    def test_snapshot_missing_label(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.snapshot_memory("a")
+        with pytest.raises(KeyError, match="No memory snapshot"):
+            session.diff_memory("a", "nonexistent")
+
+    def test_snapshot_overwrites(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        r1 = session.snapshot_memory("snap")
+        assert r1["label"] == "snap"
+        r2 = session.snapshot_memory("snap")  # overwrite
+        assert r2["label"] == "snap"
+
+    def test_snapshot_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            write_memory, snapshot_memory, diff_memory,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+        write_memory(session_id=sid, address=0x1000, data="41424344")
+        r = snapshot_memory(session_id=sid, label="before")
+        assert "error" not in r
+        assert r["label"] == "before"
+
+        write_memory(session_id=sid, address=0x1000, data="ff4243ee")
+        snapshot_memory(session_id=sid, label="after")
+
+        r = diff_memory(session_id=sid, label_a="before", label_b="after")
+        assert "error" not in r
+        assert r["change_count"] >= 1
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: Stack View
+# ---------------------------------------------------------------------------
+
+class TestStackView:
+    def test_get_stack_basic(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x7F000, 0x1000)
+        # Set SP to top of mapped region.
+        session.set_register("esp", 0x7F000)
+        # Write some known values.
+        import struct
+        for i in range(4):
+            session.write_memory(0x7F000 + i * 4, struct.pack("<I", 0xDEAD0000 + i))
+        result = session.get_stack(count=4)
+        assert result["sp"] == 0x7F000
+        assert result["pointer_size"] == 4
+        assert result["count"] == 4
+        assert result["entries"][0]["value"] == 0xDEAD0000
+        assert result["entries"][1]["value"] == 0xDEAD0001
+
+    def test_get_stack_with_symbols(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x7F000, 0x1000)
+        session.set_register("esp", 0x7F000)
+        import struct
+        session.write_memory(0x7F000, struct.pack("<I", 0x401000))
+        session.add_symbol("main", 0x401000)
+        result = session.get_stack(count=1)
+        assert result["entries"][0]["symbol"] == "main"
+
+    def test_get_stack_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            write_memory, set_registers, get_stack,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x7F000, size=0x1000)
+        set_registers(session_id=sid, values={"esp": 0x7F000})
+        write_memory(session_id=sid, address=0x7F000, data="efbeadde")
+        r = get_stack(session_id=sid, count=1)
+        assert "error" not in r
+        assert r["count"] >= 1
+        assert r["entries"][0]["value"] == 0xDEADBEEF
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Feature 5: Memory Map Visualization
+# ---------------------------------------------------------------------------
+
+class TestMemoryMap:
+    def test_memory_map_basic(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)  # rwx by default
+        text = session.memory_map()
+        assert "0x00001000" in text
+        assert "rwx" in text
+
+    def test_memory_map_gap_shown(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.map_memory(0x5000, 0x1000)
+        text = session.memory_map()
+        assert "gap" in text
+
+    def test_memory_map_symbols(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.add_symbol("entry", 0x1000)
+        text = session.memory_map()
+        assert "entry" in text
+
+    def test_memory_map_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory, memory_map,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+        r = memory_map(session_id=sid)
+        assert "error" not in r
+        assert r["region_count"] == 1
+        assert "0x00001000" in r["map"]
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Feature 8: Trace Diff
+# ---------------------------------------------------------------------------
+
+class TestTraceDiff:
+    def test_save_and_diff_identical_traces(self, manager: SessionManager) -> None:
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2")
+        code = bytes(encoding)
+        session.write_memory(0x1000, code)
+
+        session.enable_trace()
+        session.emulate(address=0x1000, count=2)
+        session.save_trace("run1")
+
+        # Identical second run.
+        session.enable_trace()
+        session.emulate(address=0x1000, count=2)
+        session.save_trace("run2")
+
+        diff = session.diff_trace("run1", "run2")
+        assert diff["common_prefix"] == 2
+        assert diff["divergence_index"] is None
+        assert diff["divergences"] == []
+
+    def test_save_and_diff_divergent_traces(self, manager: SessionManager) -> None:
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+
+        # Run 1: mov eax, 1; mov ebx, 2
+        enc1, _ = ks.asm("mov eax, 1; mov ebx, 2")
+        session.write_memory(0x1000, bytes(enc1))
+        session.enable_trace()
+        session.emulate(address=0x1000, count=2)
+        session.save_trace("run1")
+
+        # Run 2: mov eax, 1; mov ecx, 3 (different second instruction)
+        enc2, _ = ks.asm("mov eax, 1; mov ecx, 3")
+        session.write_memory(0x1000, bytes(enc2))
+        session.enable_trace()
+        session.emulate(address=0x1000, count=2)
+        session.save_trace("run2")
+
+        diff = session.diff_trace("run1", "run2")
+        assert diff["common_prefix"] == 1  # first instruction matches
+        assert diff["divergence_index"] == 1
+        assert len(diff["divergences"]) >= 1
+
+    def test_diff_trace_missing_label(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        with pytest.raises(KeyError, match="No saved trace"):
+            session.diff_trace("nope", "also_nope")
+
+    def test_save_trace_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            write_memory, assemble, enable_trace, emulate,
+            save_trace, diff_trace,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+
+        asm = assemble(arch="x86_32", code="mov eax, 1; mov ebx, 2", address=0x1000)
+        write_memory(session_id=sid, address=0x1000, data=asm["bytes_hex"])
+
+        enable_trace(session_id=sid)
+        emulate(session_id=sid, address=0x1000, count=2)
+        r = save_trace(session_id=sid, label="run1")
+        assert "error" not in r
+        assert r["entries"] == 2
+
+        enable_trace(session_id=sid)
+        emulate(session_id=sid, address=0x1000, count=2)
+        save_trace(session_id=sid, label="run2")
+
+        r = diff_trace(session_id=sid, label_a="run1", label_b="run2")
+        assert "error" not in r
+        assert r["common_prefix"] == 2
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Feature 6: Conditional Breakpoints
+# ---------------------------------------------------------------------------
+
+class TestConditionalBreakpoints:
+    def test_conditional_breakpoint_fires_when_met(self, manager: SessionManager) -> None:
+        """Breakpoint with 'eax == 1' fires after mov eax,1."""
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # mov eax, 1; mov ebx, 2  (bp on second instruction)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2")
+        code = bytes(encoding)
+        session.write_memory(0x1000, code)
+
+        # Address of second instruction.
+        bp_addr = 0x1000 + 5  # first mov is 5 bytes
+        session.add_breakpoint(bp_addr, condition="eax == 1")
+        result = session.emulate(address=0x1000, count=10)
+        assert result["stop_reason"] == "breakpoint"
+        assert result["breakpoint_address"] == bp_addr
+
+    def test_conditional_breakpoint_skipped_when_not_met(self, manager: SessionManager) -> None:
+        """Breakpoint with 'eax == 99' does NOT fire when eax is 1."""
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2")
+        code = bytes(encoding)
+        session.write_memory(0x1000, code)
+
+        bp_addr = 0x1000 + 5
+        session.add_breakpoint(bp_addr, condition="eax == 99")
+        result = session.emulate(address=0x1000, count=2)
+        assert result["stop_reason"] == "count_exhausted"
+
+    def test_unconditional_breakpoint_still_works(self, manager: SessionManager) -> None:
+        """No condition = always fire (backward compat)."""
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2")
+        code = bytes(encoding)
+        session.write_memory(0x1000, code)
+
+        bp_addr = 0x1000 + 5
+        session.add_breakpoint(bp_addr)  # no condition
+        result = session.emulate(address=0x1000, count=10)
+        assert result["stop_reason"] == "breakpoint"
+
+    def test_invalid_condition_rejected(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        with pytest.raises(ValueError, match="Invalid condition"):
+            session.add_breakpoint(0x1000, condition="garbage!!!")
+
+    def test_invalid_register_in_condition_rejected(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        with pytest.raises(ValueError, match="Unknown register"):
+            session.add_breakpoint(0x1000, condition="xyz == 1")
+
+    def test_condition_with_and_or(self, manager: SessionManager) -> None:
+        from keystone import Ks
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # mov eax, 1; mov ebx, 2; nop
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2; nop")
+        session.write_memory(0x1000, bytes(encoding))
+
+        # BP on nop (offset 10), condition: eax == 1 and ebx == 2
+        bp_addr = 0x1000 + 10
+        session.add_breakpoint(bp_addr, condition="eax == 1 and ebx == 2")
+        result = session.emulate(address=0x1000, count=10)
+        assert result["stop_reason"] == "breakpoint"
+
+    def test_conditional_breakpoint_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            write_memory, assemble, add_breakpoint,
+            list_breakpoints, emulate,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+
+        asm = assemble(arch="x86_32", code="mov eax, 1; mov ebx, 2", address=0x1000)
+        write_memory(session_id=sid, address=0x1000, data=asm["bytes_hex"])
+
+        r = add_breakpoint(session_id=sid, address=0x1005, condition="eax == 1")
+        assert "error" not in r
+        assert r["condition"] == "eax == 1"
+
+        r = list_breakpoints(session_id=sid)
+        assert r["breakpoints"][0]["condition"] == "eax == 1"
+
+        r = emulate(session_id=sid, address=0x1000, count=10)
+        assert r["stop_reason"] == "breakpoint"
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: Syscall Hooking
+# ---------------------------------------------------------------------------
+
+class TestSyscallHooking:
+    def test_hook_syscall_x86_64_skip(self, manager: SessionManager) -> None:
+        """x86_64 syscall instruction gets hooked in skip mode."""
+        from keystone import Ks
+        arch = get_arch("x86_64")
+        session = manager.create("x86_64")
+        session.map_memory(0x1000, 0x1000)
+
+        # mov rax, 1 (write syscall); syscall; mov rbx, 1
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov rax, 1; syscall; mov rbx, 1", addr=0x1000)
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.hook_syscall(mode="skip", default_return=42)
+        result = session.emulate(address=0x1000, count=3)
+        # Should have completed all 3 instructions.
+        assert result["stop_reason"] == "count_exhausted"
+        # rax should be 42 (return from syscall), rbx should be 1.
+        assert result["registers"]["rax"] == 42
+        assert result["registers"]["rbx"] == 1
+
+        log = session.get_syscall_log()
+        assert log["total"] == 1
+        assert log["entries"][0]["syscall_nr"] == 1
+
+    def test_hook_syscall_stop_mode(self, manager: SessionManager) -> None:
+        from keystone import Ks
+        arch = get_arch("x86_64")
+        session = manager.create("x86_64")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov rax, 60; syscall; mov rbx, 1", addr=0x1000)
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.hook_syscall(mode="stop")
+        result = session.emulate(address=0x1000, count=10)
+        # Should have stopped at syscall, NOT executed mov rbx.
+        assert result["registers"]["rbx"] == 0
+        log = session.get_syscall_log()
+        assert log["total"] == 1
+        assert log["entries"][0]["syscall_nr"] == 60
+
+    def test_unhook_syscall(self, manager: SessionManager) -> None:
+        session = manager.create("x86_64")
+        session.hook_syscall(mode="skip")
+        result = session.unhook_syscall()
+        assert result["unhooked"] is True
+
+    def test_hook_invalid_mode(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        with pytest.raises(ValueError, match="Invalid syscall mode"):
+            session.hook_syscall(mode="invalid")
+
+    def test_hook_syscall_tool(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            write_memory, assemble, hook_syscall,
+            unhook_syscall, get_syscall_log, emulate,
+        )
+        r = create_emulator(arch="x86_64")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+
+        asm = assemble(arch="x86_64", code="mov rax, 1; syscall", address=0x1000)
+        write_memory(session_id=sid, address=0x1000, data=asm["bytes_hex"])
+
+        r = hook_syscall(session_id=sid, mode="skip", default_return=0)
+        assert "error" not in r
+
+        emulate(session_id=sid, address=0x1000, count=2)
+
+        r = get_syscall_log(session_id=sid)
+        assert "error" not in r
+        assert r["total"] == 1
+
+        r = unhook_syscall(session_id=sid)
+        assert "error" not in r
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Feature 3: Executable Loader (basic — no real binary, just tests error path)
+# ---------------------------------------------------------------------------
+
+class TestExecutableLoader:
+    def test_load_invalid_binary_raises(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        with pytest.raises(ValueError, match="Failed to parse"):
+            session.load_executable(b"not a real binary")
+
+    def test_load_executable_tool_invalid(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, load_executable,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        r = load_executable(session_id=sid, data="deadbeef")
+        assert "error" in r
+        destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Feature 9: Session Serialization
+# ---------------------------------------------------------------------------
+
+class TestSessionSerialization:
+    def test_export_import_roundtrip(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+        session.write_memory(0x1000, b"\xde\xad\xbe\xef")
+        session.set_register("eax", 42)
+        session.add_breakpoint(0x1000)
+        session.add_symbol("main", 0x1000)
+
+        state = session.export_state()
+        assert state["version"] == 1
+        assert state["arch"] == "x86_32"
+        assert len(state["regions"]) == 1
+        assert state["registers"]["eax"] == 42
+        assert len(state["breakpoints"]) == 1
+        assert len(state["symbols"]) == 1
+
+        # Import into new session.
+        session2 = manager.create("x86_32")
+        session2.import_state(state)
+        assert session2.read_memory(0x1000, 4) == b"\xde\xad\xbe\xef"
+        assert session2.get_register("eax") == 42
+        assert len(session2.breakpoints) == 1
+        assert len(session2.list_symbols()) == 1
+
+    def test_import_arch_mismatch(self, manager: SessionManager) -> None:
+        session = manager.create("x86_32")
+        state = session.export_state()
+        session2 = manager.create("x86_64")
+        with pytest.raises(ValueError, match="does not match"):
+            session2.import_state(state)
+
+    def test_export_import_tools(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            write_memory, set_registers, add_symbol,
+            export_session, import_session,
+        )
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+        write_memory(session_id=sid, address=0x1000, data="deadbeef")
+        set_registers(session_id=sid, values={"eax": 99})
+        add_symbol(session_id=sid, name="start", address=0x1000)
+
+        state = export_session(session_id=sid)
+        assert "error" not in state
+        assert state["version"] == 1
+
+        r = import_session(arch="x86_32", state=state)
+        assert "error" not in r
+        assert "session_id" in r
+        assert r["regions_restored"] == 1
+        assert r["symbols_restored"] == 1
+
+        destroy_emulator(session_id=sid)
+        destroy_emulator(session_id=r["session_id"])
