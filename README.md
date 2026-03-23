@@ -21,13 +21,16 @@ Agents can create isolated emulation sessions, load code or full executables, se
 
 RISC-V architectures lack a Keystone backend, so the `assemble` tool returns an error for them. Disassembly and emulation work normally.
 
-## Setup
+## Install
 
-Requires Python 3.10+. Install with [uv](https://docs.astral.sh/uv/):
+Requires Python 3.10+.
 
 ```bash
-uv venv .venv
-uv pip install -e ".[dev]"
+# Run directly (no install needed)
+uvx mcp-emulate
+
+# Or install globally
+uv pip install mcp-emulate
 ```
 
 ## Usage
@@ -40,8 +43,8 @@ Add to your MCP client configuration:
 {
   "mcpServers": {
     "mcp-emulate": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/MCPEmulate", "mcp-emulate"]
+      "command": "uvx",
+      "args": ["mcp-emulate"]
     }
   }
 }
@@ -203,6 +206,15 @@ tests/
 - **`ks_arch`/`ks_mode` are `Optional`** on `ArchConfig` so architectures without Keystone (RISC-V) can exist without a dummy value. The `assemble` tool checks this and returns a clear error.
 - **`load_executable` writes via `uc.mem_write()` directly**, bypassing the permission check on `write_memory`. This is intentional -- binary loaders need to populate read-only segments.
 - **Session serialization is versioned** (`"version": 1`) for forward compatibility.
+
+## Development
+
+```bash
+git clone https://github.com/LabGuy94/MCPEmulate.git
+cd MCPEmulate
+uv venv .venv
+uv pip install -e ".[dev]"
+```
 
 ## Tests
 
