@@ -480,6 +480,62 @@ def restore_context(session_id: str, label: str) -> dict:
         return _error(str(exc))
 
 
+# -- Trace tools ---------------------------------------------------------------
+
+
+@mcp.tool()
+def enable_trace(session_id: str, max_entries: int = 10000) -> dict:
+    """Enable execution tracing.
+
+    Clears any existing trace log and starts recording.
+
+    Args:
+        session_id: The session ID.
+        max_entries: Maximum trace entries to record (default 10000).
+    """
+    try:
+        session = sessions.get(session_id)
+        session.enable_trace(max_entries=max_entries)
+        return {"enabled": True, "max_entries": max_entries}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def disable_trace(session_id: str) -> dict:
+    """Disable execution tracing.
+
+    The trace log is preserved for inspection via get_trace.
+
+    Args:
+        session_id: The session ID.
+    """
+    try:
+        session = sessions.get(session_id)
+        count = session.disable_trace()
+        return {"enabled": False, "entries": count}
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def get_trace(session_id: str, offset: int = 0, limit: int = 100) -> dict:
+    """Get trace entries with pagination.
+
+    Each entry includes disassembled instruction details.
+
+    Args:
+        session_id: The session ID.
+        offset: Start index (default 0).
+        limit: Max entries to return (default 100).
+    """
+    try:
+        session = sessions.get(session_id)
+        return session.get_trace(offset=offset, limit=limit)
+    except (KeyError, Exception) as exc:
+        return _error(str(exc))
+
+
 # -- Standalone tools (no session needed) ------------------------------------
 
 

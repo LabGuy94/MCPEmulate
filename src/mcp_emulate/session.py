@@ -58,7 +58,7 @@ class MemoryRegion:
 class EmulationSession:
     """Wraps a single Unicorn engine instance with bookkeeping."""
 
-    __slots__ = ("id", "arch", "uc", "mapped_regions", "_insn_count", "breakpoints", "_contexts", "_hit_breakpoint", "_watchpoints", "_hit_watchpoint")
+    __slots__ = ("id", "arch", "uc", "mapped_regions", "_insn_count", "breakpoints", "_contexts", "_hit_breakpoint", "_watchpoints", "_hit_watchpoint", "_trace_enabled", "_trace_log", "_trace_max")
 
     def __init__(self, session_id: str, arch: ArchConfig) -> None:
         self.id = session_id
@@ -71,6 +71,9 @@ class EmulationSession:
         self._hit_breakpoint: int | None = None
         self._watchpoints: dict[int, tuple[int, int, str]] = {}  # addr -> (hook_handle, size, access_str)
         self._hit_watchpoint: dict | None = None
+        self._trace_enabled: bool = False
+        self._trace_log: list[tuple[int, bytes]] = []  # (address, insn_bytes)
+        self._trace_max: int = 10_000
 
     # -- Memory operations ---------------------------------------------------
 
@@ -197,6 +200,10 @@ class EmulationSession:
             if address in self.breakpoints:
                 self._hit_breakpoint = address
                 uc.emu_stop()
+                return
+            if self._trace_enabled and len(self._trace_log) < self._trace_max:
+                insn_bytes = bytes(uc.mem_read(address, size))
+                self._trace_log.append((address, insn_bytes))
 
         hook_handle = self.uc.hook_add(UC_HOOK_CODE, _code_hook)
         stop_reason = "completed"
@@ -306,6 +313,41 @@ class EmulationSession:
             [{"address": addr, "size": info[1], "access": info[2]} for addr, info in self._watchpoints.items()],
             key=lambda w: w["address"],
         )
+
+    # -- Trace operations -------------------------------------------------------
+
+    def enable_trace(self, max_entries: int = 10_000) -> None:
+        """Enable instruction tracing, clearing any existing log."""
+        self._trace_enabled = True
+        self._trace_log = []
+        self._trace_max = max_entries
+
+    def disable_trace(self) -> int:
+        """Disable tracing. Log is preserved. Returns entry count."""
+        self._trace_enabled = False
+        return len(self._trace_log)
+
+    def get_trace(self, offset: int = 0, limit: int = 100) -> dict:
+        """Get trace entries with pagination. Disassembles on the fly."""
+        from capstone import Cs
+
+        cs = Cs(self.arch.cs_arch, self.arch.cs_mode)
+        total = len(self._trace_log)
+        selected = self._trace_log[offset:offset + limit]
+        entries = []
+        for i, (addr, raw) in enumerate(selected, start=offset):
+            insn = next(cs.disasm(raw, addr, count=1), None)
+            entry: dict = {
+                "index": i,
+                "address": addr,
+                "bytes_hex": raw.hex(),
+                "size": len(raw),
+            }
+            if insn is not None:
+                entry["mnemonic"] = insn.mnemonic
+                entry["op_str"] = insn.op_str
+            entries.append(entry)
+        return {"entries": entries, "total": total, "offset": offset, "limit": limit}
 
     # -- Stepping ------------------------------------------------------------
 

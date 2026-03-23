@@ -794,3 +794,163 @@ class TestServerMemoryTools:
         assert r["count"] == 0
 
         destroy_emulator(session_id=sid)
+
+
+# ---------------------------------------------------------------------------
+# Execution Trace (Iteration 4)
+# ---------------------------------------------------------------------------
+
+class TestTrace:
+    def test_trace_basic(self, manager: SessionManager) -> None:
+        """Enable trace, emulate 3 instructions, verify 3 entries with correct mnemonics."""
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2; mov ecx, 3")
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.enable_trace()
+        session.emulate(address=0x1000, count=3)
+        trace = session.get_trace()
+        assert trace["total"] == 3
+        assert trace["entries"][0]["mnemonic"] == "mov"
+        assert trace["entries"][0]["address"] == 0x1000
+        assert trace["entries"][2]["index"] == 2
+
+    def test_trace_disabled_by_default(self, manager: SessionManager) -> None:
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2")
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.emulate(address=0x1000, count=2)
+        trace = session.get_trace()
+        assert trace["total"] == 0
+        assert trace["entries"] == []
+
+    def test_trace_with_breakpoint(self, manager: SessionManager) -> None:
+        """Breakpointed instruction NOT in trace, preceding instructions ARE."""
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        # 3 instructions: each 'mov reg, imm32' is 5 bytes
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2; mov ecx, 3")
+        session.write_memory(0x1000, bytes(encoding))
+
+        # Breakpoint on 3rd instruction (offset 10)
+        session.add_breakpoint(0x1000 + 10)
+        session.enable_trace()
+        result = session.emulate(address=0x1000, count=10)
+        assert result["stop_reason"] == "breakpoint"
+
+        trace = session.get_trace()
+        # Only 2 instructions traced (3rd was breakpointed, not traced)
+        assert trace["total"] == 2
+        assert trace["entries"][0]["address"] == 0x1000
+        assert trace["entries"][1]["address"] == 0x1000 + 5
+
+    def test_trace_pagination(self, manager: SessionManager) -> None:
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2; mov ecx, 3; mov edx, 4; inc eax")
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.enable_trace()
+        session.emulate(address=0x1000, count=5)
+
+        trace = session.get_trace(offset=2, limit=2)
+        assert trace["total"] == 5
+        assert len(trace["entries"]) == 2
+        assert trace["entries"][0]["index"] == 2
+        assert trace["entries"][1]["index"] == 3
+
+    def test_trace_max_cap(self, manager: SessionManager) -> None:
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2; mov ecx, 3; mov edx, 4; inc eax")
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.enable_trace(max_entries=3)
+        session.emulate(address=0x1000, count=5)
+        trace = session.get_trace(limit=10)
+        assert trace["total"] == 3  # capped
+
+    def test_enable_clears_previous(self, manager: SessionManager) -> None:
+        from keystone import Ks
+
+        arch = get_arch("x86_32")
+        session = manager.create("x86_32")
+        session.map_memory(0x1000, 0x1000)
+
+        ks = Ks(arch.ks_arch, arch.ks_mode)
+        encoding, _ = ks.asm("mov eax, 1; mov ebx, 2")
+        session.write_memory(0x1000, bytes(encoding))
+
+        session.enable_trace()
+        session.emulate(address=0x1000, count=2)
+        assert session.get_trace()["total"] == 2
+
+        # Enable again — should clear
+        session.enable_trace()
+        assert session.get_trace()["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Server tools — Trace (Iteration 4)
+# ---------------------------------------------------------------------------
+
+class TestServerTraceTools:
+    def test_trace_tool_roundtrip(self) -> None:
+        from mcp_emulate.server import (
+            create_emulator, destroy_emulator, map_memory,
+            write_memory, assemble, emulate,
+            enable_trace, disable_trace, get_trace,
+        )
+
+        r = create_emulator(arch="x86_32")
+        sid = r["session_id"]
+        map_memory(session_id=sid, address=0x1000, size=0x1000)
+
+        asm = assemble(arch="x86_32", code="mov eax, 1; mov ebx, 2", address=0x1000)
+        write_memory(session_id=sid, address=0x1000, data=asm["bytes_hex"])
+
+        r = enable_trace(session_id=sid)
+        assert "error" not in r
+        assert r["enabled"] is True
+
+        emulate(session_id=sid, address=0x1000, count=2)
+
+        r = get_trace(session_id=sid)
+        assert "error" not in r
+        assert r["total"] == 2
+        assert r["entries"][0]["mnemonic"] == "mov"
+
+        r = disable_trace(session_id=sid)
+        assert "error" not in r
+        assert r["enabled"] is False
+        assert r["entries"] == 2
+
+        destroy_emulator(session_id=sid)
